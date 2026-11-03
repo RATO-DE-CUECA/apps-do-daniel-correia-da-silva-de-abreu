@@ -39,6 +39,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var previewView: PreviewView
     private lateinit var overlay: HandOverlayView
     private lateinit var modeButton: Button
+    private lateinit var flipButton: Button
     private lateinit var cameraExecutor: ExecutorService
 
     private var handLandmarker: HandLandmarker? = null
@@ -92,7 +93,8 @@ class MainActivity : AppCompatActivity() {
         modeButton = findViewById(R.id.modeButton)
         cameraExecutor = Executors.newSingleThreadExecutor()
 
-        findViewById<Button>(R.id.flipButton).setOnClickListener {
+        flipButton = findViewById(R.id.flipButton)
+        flipButton.setOnClickListener {
             lensFacing = if (lensFacing == CameraSelector.LENS_FACING_FRONT)
                 CameraSelector.LENS_FACING_BACK else CameraSelector.LENS_FACING_FRONT
             overlay.clear()
@@ -137,6 +139,8 @@ class MainActivity : AppCompatActivity() {
         // então o PreviewView normal fica escondido.
         previewView.visibility = if (vrMode) View.GONE else View.VISIBLE
         overlay.vrMode = vrMode
+        // No VR Box a câmera é sempre a traseira, então o botão de virar câmera some.
+        flipButton.visibility = if (vrMode) View.GONE else View.VISIBLE
         modeButton.text = if (vrMode) "Modo normal" else "Modo VR Box"
         overlay.clear()
     }
