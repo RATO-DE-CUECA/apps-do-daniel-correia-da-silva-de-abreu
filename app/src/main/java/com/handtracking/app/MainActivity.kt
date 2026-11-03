@@ -3,6 +3,7 @@ package com.handtracking.app
 import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Matrix
 import android.os.SystemClock
 import android.os.Bundle
@@ -20,6 +21,7 @@ import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
@@ -34,6 +36,11 @@ class MainActivity : AppCompatActivity() {
 
     private var handLandmarker: HandLandmarker? = null
     private var lensFacing = CameraSelector.LENS_FACING_FRONT
+
+    // Bitmaps e matriz reaproveitados a cada frame (evita alocar memória 30x por segundo).
+    private var frameBitmap: Bitmap? = null
+    private var preparedBitmap: Bitmap? = null
+    private val transform = Matrix()
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -65,25 +72,40 @@ class MainActivity : AppCompatActivity() {
         ) startCamera() else permissionLauncher.launch(Manifest.permission.CAMERA)
     }
 
+    private fun buildLandmarker(delegate: Delegate): HandLandmarker {
+        val options = HandLandmarker.HandLandmarkerOptions.builder()
+            .setBaseOptions(
+                BaseOptions.builder()
+                    .setModelAssetPath("hand_landmarker.task")
+                    .setDelegate(delegate)
+                    .build()
+            )
+            .setRunningMode(RunningMode.LIVE_STREAM)
+            .setNumHands(2)
+            .setMinHandDetectionConfidence(0.5f)
+            .setMinHandPresenceConfidence(0.5f)
+            .setMinTrackingConfidence(0.5f)
+            .setResultListener { result: HandLandmarkerResult, input ->
+                overlay.setResults(result, input.width, input.height)
+            }
+            .setErrorListener { error ->
+                runOnUiThread { Toast.makeText(this, error.message, Toast.LENGTH_SHORT).show() }
+            }
+            .build()
+        return HandLandmarker.createFromOptions(this, options)
+    }
+
     private fun setupHandLandmarker() {
-        try {
-            val options = HandLandmarker.HandLandmarkerOptions.builder()
-                .setBaseOptions(BaseOptions.builder().setModelAssetPath("hand_landmarker.task").build())
-                .setRunningMode(RunningMode.LIVE_STREAM)
-                .setNumHands(2)
-                .setMinHandDetectionConfidence(0.5f)
-                .setMinHandPresenceConfidence(0.5f)
-                .setMinTrackingConfidence(0.5f)
-                .setResultListener { result: HandLandmarkerResult, input ->
-                    overlay.setResults(result, input.width, input.height)
-                }
-                .setErrorListener { error ->
-                    runOnUiThread { Toast.makeText(this, error.message, Toast.LENGTH_SHORT).show() }
-                }
-                .build()
-            handLandmarker = HandLandmarker.createFromOptions(this, options)
+        // Tenta usar a GPU (bem mais rápido). Se o celular não suportar, cai para a CPU.
+        handLandmarker = try {
+            buildLandmarker(Delegate.GPU)
         } catch (e: Exception) {
-            Toast.makeText(this, R.string.model_error, Toast.LENGTH_LONG).show()
+            try {
+                buildLandmarker(Delegate.CPU)
+            } catch (e2: Exception) {
+                Toast.makeText(this, R.string.model_error, Toast.LENGTH_LONG).show()
+                null
+            }
         }
     }
 
@@ -121,18 +143,37 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val bitmap = Bitmap.createBitmap(imageProxy.width, imageProxy.height, Bitmap.Config.ARGB_8888)
+        val w = imageProxy.width
+        val h = imageProxy.height
         val rotation = imageProxy.imageInfo.rotationDegrees
-        imageProxy.use { bitmap.copyPixelsFromBuffer(it.planes[0].buffer) }
 
-        val matrix = Matrix().apply {
-            postRotate(rotation.toFloat())
-            // Câmera frontal: espelha para ficar igual ao preview.
-            if (lensFacing == CameraSelector.LENS_FACING_FRONT) {
-                postScale(-1f, 1f, bitmap.width / 2f, bitmap.height / 2f)
-            }
+        // Reaproveita o bitmap do frame se o tamanho não mudou.
+        var frame = frameBitmap
+        if (frame == null || frame.width != w || frame.height != h) {
+            frame = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            frameBitmap = frame
         }
-        val prepared = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        imageProxy.use { frame.copyPixelsFromBuffer(it.planes[0].buffer) }
+
+        // Tamanho final depois da rotação.
+        val outW = if (rotation % 180 == 0) w else h
+        val outH = if (rotation % 180 == 0) h else w
+
+        var prepared = preparedBitmap
+        if (prepared == null || prepared.width != outW || prepared.height != outH) {
+            prepared = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
+            preparedBitmap = prepared
+        }
+
+        // Rotação + espelho (câmera frontal) em uma única operação, sem criar bitmap novo.
+        transform.reset()
+        transform.postTranslate(-w / 2f, -h / 2f)
+        transform.postRotate(rotation.toFloat())
+        if (lensFacing == CameraSelector.LENS_FACING_FRONT) {
+            transform.postScale(-1f, 1f)
+        }
+        transform.postTranslate(outW / 2f, outH / 2f)
+        Canvas(prepared).drawBitmap(frame, transform, null)
 
         landmarker.detectAsync(BitmapImageBuilder(prepared).build(), SystemClock.uptimeMillis())
     }
