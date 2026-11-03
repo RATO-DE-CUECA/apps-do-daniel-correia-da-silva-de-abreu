@@ -1,3 +1,5 @@
+import java.net.URI
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -47,8 +49,8 @@ val downloadModel = tasks.register("downloadModel") {
     doLast {
         if (!modelFile.exists()) {
             modelFile.parentFile.mkdirs()
-            val url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
-            java.net.URL(url).openStream().use { input ->
+            val modelUrl = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+            URI(modelUrl).toURL().openStream().use { input ->
                 modelFile.outputStream().use { output -> input.copyTo(output) }
             }
         }
