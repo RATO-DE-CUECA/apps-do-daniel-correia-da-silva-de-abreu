@@ -22,4 +22,13 @@
         android:layout_marginBottom="32dp"
         android:text="@string/flip_camera" />
 
+    <!-- Botão do cantinho: alterna entre modo VR Box (tela dividida) e modo normal. -->
+    <Button
+        android:id="@+id/modeButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:layout_margin="12dp"
+        android:textSize="12sp" />
+
 </FrameLayout>
