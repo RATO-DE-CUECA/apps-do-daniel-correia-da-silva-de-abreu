@@ -11,12 +11,16 @@ import android.util.AttributeSet
 import android.view.View
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
+import kotlin.math.abs
 import kotlin.math.hypot
+import kotlin.math.max
 import kotlin.math.min
 
 /**
  * Desenha o esqueleto da mão: linhas brancas e pontos azuis.
- * Também desenha objetos virtuais (bolinha e cubo) que ficam verdes quando o dedo indicador encosta.
+ * Também desenha objetos virtuais (bolinha e cubo):
+ *  - verde  = o dedo indicador está encostando;
+ *  - azul   = você está segurando com a pinça (polegar + indicador) e pode arrastar.
  * No modo VR Box também desenha a imagem da câmera e repete tudo para os dois olhos.
  */
 class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs) {
@@ -52,7 +56,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     }
     private val frameRect = RectF()
 
-    // ---- Objetos virtuais (posições em pixels da imagem da câmera) ----
+    // ---- Objetos virtuais ----
     private val objectPaint = Paint().apply {
         isAntiAlias = true
         style = Paint.Style.FILL
@@ -63,18 +67,43 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         strokeWidth = 3f
         color = Color.argb(160, 0, 0, 0)
     }
+    private val pinchPaint = Paint().apply {
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        strokeWidth = 4f
+        color = Color.YELLOW
+    }
     private val facePath = Path()
 
+    // Posição do CENTRO de cada objeto, de 0 a 1 (fração da imagem da câmera).
+    private var ballNX = 0.25f
+    private var ballNY = 0.5f
+    private var cubeNX = 0.75f
+    private var cubeNY = 0.5f
+
+    // Geometria em pixels da imagem da câmera (recalculada a cada desenho).
     private var sceneReady = false
     private var ballX = 0f
     private var ballY = 0f
     private var ballR = 0f
+    private var cubeCX = 0f  // centro do cubo
+    private var cubeCY = 0f
     private var cubeX = 0f   // canto esquerdo da face da frente
     private var cubeY = 0f   // topo da face da frente
     private var cubeS = 0f   // lado da face da frente
     private var cubeD = 0f   // "profundidade" desenhada do cubo
-    private var ballTouched = false
-    private var cubeTouched = false
+
+    // Estado de cada objeto: 0 = normal, 1 = dedo encostando, 2 = segurado.
+    private var ballState = 0
+    private var cubeState = 0
+
+    // Pegar e mover.
+    private var grabbed = NONE
+    private var grabOffsetX = 0f
+    private var grabOffsetY = 0f
+    private val pinchX = FloatArray(MAX_HANDS)
+    private val pinchY = FloatArray(MAX_HANDS)
+    private var pinchCount = 0
 
     fun setResults(newResult: HandLandmarkerResult?, width: Int, height: Int) {
         result = newResult
@@ -92,6 +121,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     fun clear() {
         result = null
         frame = null
+        grabbed = NONE
         postInvalidate()
     }
 
@@ -113,41 +143,115 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         }
     }
 
-    /** Calcula onde ficam a bolinha e o cubo e se o dedo indicador está encostando neles. */
+    /** Converte as posições (0 a 1) dos objetos em pixels da imagem. */
+    private fun applyGeometry(iw: Float, ih: Float) {
+        val u = min(iw, ih)
+        ballR = u * 0.10f
+        cubeS = u * 0.17f
+        cubeD = cubeS * 0.35f
+
+        ballX = ballNX * iw
+        ballY = ballNY * ih
+        cubeCX = cubeNX * iw
+        cubeCY = cubeNY * ih
+        cubeX = cubeCX - (cubeS + cubeD) / 2f
+        cubeY = cubeCY - (cubeS - cubeD) / 2f
+    }
+
+    /**
+     * Calcula onde estão os objetos, se o dedo indicador encosta neles
+     * e se a pinça está segurando algum (e então move o objeto).
+     */
     private fun updateScene(iw: Float, ih: Float) {
         sceneReady = iw > 1f && ih > 1f
         if (!sceneReady) return
 
-        val u = min(iw, ih)
+        applyGeometry(iw, ih)
 
-        ballX = iw * 0.25f
-        ballY = ih * 0.5f
-        ballR = u * 0.10f
+        var ballTouch = false
+        var cubeTouch = false
+        pinchCount = 0
 
-        cubeS = u * 0.17f
-        cubeD = cubeS * 0.35f
-        val cubeCenterX = iw * 0.75f
-        val cubeCenterY = ih * 0.5f
-        cubeX = cubeCenterX - (cubeS + cubeD) / 2f
-        cubeY = cubeCenterY - (cubeS - cubeD) / 2f
-
-        var ballHit = false
-        var cubeHit = false
         val res = result
         if (res != null) {
             for (hand in res.landmarks()) {
-                if (hand.size <= INDEX_TIP) continue
+                if (hand.size <= MIDDLE_MCP) continue
+
+                // Dedo indicador encostando?
                 val fx = hand[INDEX_TIP].x() * iw
                 val fy = hand[INDEX_TIP].y() * ih
-
-                if (hypot(fx - ballX, fy - ballY) <= ballR * 1.1f) ballHit = true
+                if (hypot(fx - ballX, fy - ballY) <= ballR * 1.1f) ballTouch = true
                 if (fx >= cubeX && fx <= cubeX + cubeS + cubeD &&
                     fy >= cubeY - cubeD && fy <= cubeY + cubeS
-                ) cubeHit = true
+                ) cubeTouch = true
+
+                // Pinça: distância polegar-indicador comparada com o tamanho da mão.
+                val tx = hand[THUMB_TIP].x() * iw
+                val ty = hand[THUMB_TIP].y() * ih
+                val handSize = hypot(
+                    (hand[WRIST].x() - hand[MIDDLE_MCP].x()) * iw,
+                    (hand[WRIST].y() - hand[MIDDLE_MCP].y()) * ih
+                )
+                if (handSize > 1f && pinchCount < MAX_HANDS) {
+                    val ratio = hypot(tx - fx, ty - fy) / handSize
+                    // Histerese: precisa fechar mais para pegar do que para soltar.
+                    val limit = if (grabbed != NONE) PINCH_RELEASE else PINCH_START
+                    if (ratio < limit) {
+                        pinchX[pinchCount] = (tx + fx) / 2f
+                        pinchY[pinchCount] = (ty + fy) / 2f
+                        pinchCount++
+                    }
+                }
             }
         }
-        ballTouched = ballHit
-        cubeTouched = cubeHit
+
+        if (grabbed == NONE) {
+            // Tenta pegar o objeto mais perto do ponto de pinça.
+            var best = NONE
+            var bestDist = Float.MAX_VALUE
+            var bestIdx = -1
+            val cubeReach = (cubeS + cubeD) / 2f * 1.25f
+            for (i in 0 until pinchCount) {
+                val dBall = hypot(pinchX[i] - ballX, pinchY[i] - ballY)
+                if (dBall <= ballR * 1.4f && dBall < bestDist) {
+                    best = BALL; bestDist = dBall; bestIdx = i
+                }
+                val dCube = hypot(pinchX[i] - cubeCX, pinchY[i] - cubeCY)
+                if (abs(pinchX[i] - cubeCX) <= cubeReach &&
+                    abs(pinchY[i] - cubeCY) <= cubeReach && dCube < bestDist
+                ) {
+                    best = CUBE; bestDist = dCube; bestIdx = i
+                }
+            }
+            if (best != NONE) {
+                grabbed = best
+                val cx = if (best == BALL) ballX else cubeCX
+                val cy = if (best == BALL) ballY else cubeCY
+                grabOffsetX = cx - pinchX[bestIdx]
+                grabOffsetY = cy - pinchY[bestIdx]
+            }
+        } else {
+            if (pinchCount == 0) {
+                grabbed = NONE   // soltou
+            } else {
+                // Segue a pinça mais perto do objeto segurado.
+                val cx = if (grabbed == BALL) ballX else cubeCX
+                val cy = if (grabbed == BALL) ballY else cubeCY
+                var idx = 0
+                var bestDist = Float.MAX_VALUE
+                for (i in 0 until pinchCount) {
+                    val d = hypot(pinchX[i] - cx, pinchY[i] - cy)
+                    if (d < bestDist) { bestDist = d; idx = i }
+                }
+                val nx = ((pinchX[idx] + grabOffsetX) / iw).coerceIn(0.08f, 0.92f)
+                val ny = ((pinchY[idx] + grabOffsetY) / ih).coerceIn(0.10f, 0.90f)
+                if (grabbed == BALL) { ballNX = nx; ballNY = ny } else { cubeNX = nx; cubeNY = ny }
+                applyGeometry(iw, ih)
+            }
+        }
+
+        ballState = if (grabbed == BALL) 2 else if (ballTouch) 1 else 0
+        cubeState = if (grabbed == CUBE) 2 else if (cubeTouch) 1 else 0
     }
 
     /** Desenha (imagem opcional +) objetos + esqueleto dentro de uma região da tela. */
@@ -176,6 +280,10 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             canvas.scale(scale, scale)
             drawBall(canvas)
             drawCube(canvas)
+            // Anel amarelo no ponto onde a pinça está fechada.
+            for (i in 0 until pinchCount) {
+                canvas.drawCircle(pinchX[i], pinchY[i], max(ballR * 0.35f, 8f), pinchPaint)
+            }
             canvas.restore()
         }
 
@@ -202,7 +310,11 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     }
 
     private fun drawBall(canvas: Canvas) {
-        objectPaint.color = if (ballTouched) Color.rgb(67, 160, 71) else Color.rgb(229, 57, 53)
+        objectPaint.color = when (ballState) {
+            2 -> Color.rgb(30, 136, 229)
+            1 -> Color.rgb(67, 160, 71)
+            else -> Color.rgb(229, 57, 53)
+        }
         canvas.drawCircle(ballX, ballY, ballR, objectPaint)
         canvas.drawCircle(ballX, ballY, ballR, outlinePaint)
         // Brilho para parecer uma esfera.
@@ -214,14 +326,22 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         val front: Int
         val top: Int
         val side: Int
-        if (cubeTouched) {
-            front = Color.rgb(67, 160, 71)
-            top = Color.rgb(129, 199, 132)
-            side = Color.rgb(46, 125, 50)
-        } else {
-            front = Color.rgb(255, 152, 0)
-            top = Color.rgb(255, 183, 77)
-            side = Color.rgb(230, 81, 0)
+        when (cubeState) {
+            2 -> {
+                front = Color.rgb(30, 136, 229)
+                top = Color.rgb(100, 181, 246)
+                side = Color.rgb(21, 101, 192)
+            }
+            1 -> {
+                front = Color.rgb(67, 160, 71)
+                top = Color.rgb(129, 199, 132)
+                side = Color.rgb(46, 125, 50)
+            }
+            else -> {
+                front = Color.rgb(255, 152, 0)
+                top = Color.rgb(255, 183, 77)
+                side = Color.rgb(230, 81, 0)
+            }
         }
         val x = cubeX
         val y = cubeY
@@ -257,6 +377,20 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     }
 
     private companion object {
-        const val INDEX_TIP = 8   // ponta do dedo indicador no modelo de mão do MediaPipe
+        // Pontos da mão no modelo do MediaPipe.
+        const val WRIST = 0
+        const val THUMB_TIP = 4
+        const val INDEX_TIP = 8
+        const val MIDDLE_MCP = 9
+
+        // Sensibilidade da pinça (distância polegar-indicador / tamanho da mão).
+        // Quanto MAIOR o número, mais "fácil" é pegar/soltar.
+        const val PINCH_START = 0.30f
+        const val PINCH_RELEASE = 0.45f
+
+        const val MAX_HANDS = 4
+        const val NONE = 0
+        const val BALL = 1
+        const val CUBE = 2
     }
 }
