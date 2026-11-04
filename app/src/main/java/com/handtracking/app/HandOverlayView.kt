@@ -5,7 +5,6 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.graphics.Path
 import android.graphics.RectF
 import android.util.AttributeSet
 import android.view.View
@@ -17,10 +16,11 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Desenha o esqueleto da mão: linhas brancas e pontos azuis.
- * Também desenha objetos virtuais (bolinha e cubo):
- *  - verde  = o dedo indicador está encostando;
- *  - azul   = você está segurando com a pinça (polegar + indicador) e pode arrastar.
+ * Desenha o esqueleto da mão e uma barra flutuante com 3 ícones (verde, vermelho e azul).
+ *  - Encostar o dedo indicador num ícone: ele cresce um pouco e acende.
+ *  - Pinça (polegar + indicador) num ícone: puxa o ícone para fora da barra e arrasta.
+ *  - Soltar o ícone em cima da barra: ele volta para o seu lugar.
+ *  - Pinça na barrinha branca embaixo da barra: move a barra inteira.
  * No modo VR Box também desenha a imagem da câmera e repete tudo para os dois olhos.
  */
 class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs) {
@@ -56,8 +56,8 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     }
     private val frameRect = RectF()
 
-    // ---- Objetos virtuais ----
-    private val objectPaint = Paint().apply {
+    // ---- Barra de ícones ----
+    private val fillPaint = Paint().apply {
         isAntiAlias = true
         style = Paint.Style.FILL
     }
@@ -65,7 +65,13 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         isAntiAlias = true
         style = Paint.Style.STROKE
         strokeWidth = 3f
-        color = Color.argb(160, 0, 0, 0)
+        color = Color.argb(140, 0, 0, 0)
+    }
+    private val grabRingPaint = Paint().apply {
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        strokeWidth = 5f
+        color = Color.WHITE
     }
     private val pinchPaint = Paint().apply {
         isAntiAlias = true
@@ -73,29 +79,44 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         strokeWidth = 4f
         color = Color.YELLOW
     }
-    private val facePath = Path()
+    private val rect = RectF()
 
-    // Posição do CENTRO de cada objeto, de 0 a 1 (fração da imagem da câmera).
-    private var ballNX = 0.25f
-    private var ballNY = 0.5f
-    private var cubeNX = 0.75f
-    private var cubeNY = 0.5f
+    private val iconColors = intArrayOf(
+        Color.rgb(67, 160, 71),   // verde
+        Color.rgb(229, 57, 53),   // vermelho
+        Color.rgb(30, 136, 229)   // azul
+    )
+
+    // Posição do CENTRO da barra, de 0 a 1 (fração da imagem da câmera).
+    private var barNX = 0.5f
+    private var barNY = 0.75f
+
+    // Ícones: dentro da barra (no seu lugar) ou soltos (posição própria, de 0 a 1).
+    private val iconInBar = BooleanArray(ICON_COUNT) { true }
+    private val iconNX = FloatArray(ICON_COUNT)
+    private val iconNY = FloatArray(ICON_COUNT)
 
     // Geometria em pixels da imagem da câmera (recalculada a cada desenho).
     private var sceneReady = false
-    private var ballX = 0f
-    private var ballY = 0f
-    private var ballR = 0f
-    private var cubeCX = 0f  // centro do cubo
-    private var cubeCY = 0f
-    private var cubeX = 0f   // canto esquerdo da face da frente
-    private var cubeY = 0f   // topo da face da frente
-    private var cubeS = 0f   // lado da face da frente
-    private var cubeD = 0f   // "profundidade" desenhada do cubo
+    private var iconS = 0f
+    private var gap = 0f
+    private var barW = 0f
+    private var barH = 0f
+    private var barCX = 0f
+    private var barCY = 0f
+    private var barLeft = 0f
+    private var barTop = 0f
+    private var handleCX = 0f
+    private var handleCY = 0f
+    private var handleW = 0f
+    private var handleH = 0f
+    private val iconCX = FloatArray(ICON_COUNT)
+    private val iconCY = FloatArray(ICON_COUNT)
 
-    // Estado de cada objeto: 0 = normal, 1 = dedo encostando, 2 = segurado.
-    private var ballState = 0
-    private var cubeState = 0
+    // Estado de cada ícone: 0 = normal, 1 = dedo encostando, 2 = segurado.
+    private val iconState = IntArray(ICON_COUNT)
+    private val iconTouch = BooleanArray(ICON_COUNT)
+    private var handleState = 0
 
     // Pegar e mover.
     private var grabbed = NONE
@@ -143,24 +164,37 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         }
     }
 
-    /** Converte as posições (0 a 1) dos objetos em pixels da imagem. */
+    /** Converte as posições (0 a 1) em pixels da imagem e calcula o tamanho de cada peça. */
     private fun applyGeometry(iw: Float, ih: Float) {
         val u = min(iw, ih)
-        ballR = u * 0.10f
-        cubeS = u * 0.17f
-        cubeD = cubeS * 0.35f
+        iconS = u * 0.13f
+        gap = iconS * 0.25f
+        barW = ICON_COUNT * iconS + (ICON_COUNT + 1) * gap
+        barH = iconS + 2f * gap
+        barCX = barNX * iw
+        barCY = barNY * ih
+        barLeft = barCX - barW / 2f
+        barTop = barCY - barH / 2f
 
-        ballX = ballNX * iw
-        ballY = ballNY * ih
-        cubeCX = cubeNX * iw
-        cubeCY = cubeNY * ih
-        cubeX = cubeCX - (cubeS + cubeD) / 2f
-        cubeY = cubeCY - (cubeS - cubeD) / 2f
+        handleW = barW * 0.6f
+        handleH = max(u * 0.012f, 5f)
+        handleCX = barCX
+        handleCY = barTop + barH + gap * 1.2f
+
+        for (i in 0 until ICON_COUNT) {
+            if (iconInBar[i]) {
+                iconCX[i] = barLeft + gap + iconS / 2f + i * (iconS + gap)
+                iconCY[i] = barCY
+            } else {
+                iconCX[i] = iconNX[i] * iw
+                iconCY[i] = iconNY[i] * ih
+            }
+        }
     }
 
     /**
-     * Calcula onde estão os objetos, se o dedo indicador encosta neles
-     * e se a pinça está segurando algum (e então move o objeto).
+     * Calcula onde está cada peça, se o dedo indicador encosta nelas
+     * e se a pinça está segurando algo (e então move).
      */
     private fun updateScene(iw: Float, ih: Float) {
         sceneReady = iw > 1f && ih > 1f
@@ -168,8 +202,8 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
         applyGeometry(iw, ih)
 
-        var ballTouch = false
-        var cubeTouch = false
+        for (i in 0 until ICON_COUNT) iconTouch[i] = false
+        var handleTouch = false
         pinchCount = 0
 
         val res = result
@@ -180,10 +214,14 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 // Dedo indicador encostando?
                 val fx = hand[INDEX_TIP].x() * iw
                 val fy = hand[INDEX_TIP].y() * ih
-                if (hypot(fx - ballX, fy - ballY) <= ballR * 1.1f) ballTouch = true
-                if (fx >= cubeX && fx <= cubeX + cubeS + cubeD &&
-                    fy >= cubeY - cubeD && fy <= cubeY + cubeS
-                ) cubeTouch = true
+                for (i in 0 until ICON_COUNT) {
+                    if (abs(fx - iconCX[i]) <= iconS * 0.55f && abs(fy - iconCY[i]) <= iconS * 0.55f) {
+                        iconTouch[i] = true
+                    }
+                }
+                if (abs(fx - handleCX) <= handleW / 2f && abs(fy - handleCY) <= iconS * 0.5f) {
+                    handleTouch = true
+                }
 
                 // Pinça: distância polegar-indicador comparada com o tamanho da mão.
                 val tx = hand[THUMB_TIP].x() * iw
@@ -206,55 +244,87 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         }
 
         if (grabbed == NONE) {
-            // Tenta pegar o objeto mais perto do ponto de pinça.
+            // Tenta pegar: primeiro um ícone, senão a barrinha de mover a barra.
             var best = NONE
             var bestDist = Float.MAX_VALUE
             var bestIdx = -1
-            val cubeReach = (cubeS + cubeD) / 2f * 1.25f
-            for (i in 0 until pinchCount) {
-                val dBall = hypot(pinchX[i] - ballX, pinchY[i] - ballY)
-                if (dBall <= ballR * 1.4f && dBall < bestDist) {
-                    best = BALL; bestDist = dBall; bestIdx = i
+            val reach = iconS * 0.65f
+            for (p in 0 until pinchCount) {
+                val px = pinchX[p]
+                val py = pinchY[p]
+                for (i in 0 until ICON_COUNT) {
+                    if (abs(px - iconCX[i]) <= reach && abs(py - iconCY[i]) <= reach) {
+                        val d = hypot(px - iconCX[i], py - iconCY[i])
+                        if (d < bestDist) { best = i; bestDist = d; bestIdx = p }
+                    }
                 }
-                val dCube = hypot(pinchX[i] - cubeCX, pinchY[i] - cubeCY)
-                if (abs(pinchX[i] - cubeCX) <= cubeReach &&
-                    abs(pinchY[i] - cubeCY) <= cubeReach && dCube < bestDist
-                ) {
-                    best = CUBE; bestDist = dCube; bestIdx = i
+                if (abs(px - handleCX) <= handleW / 2f + iconS * 0.3f && abs(py - handleCY) <= iconS * 0.5f) {
+                    // Soma iconS para o ícone ganhar quando os dois estiverem no mesmo ponto.
+                    val d = hypot(px - handleCX, py - handleCY) + iconS
+                    if (d < bestDist) { best = HANDLE; bestDist = d; bestIdx = p }
                 }
             }
             if (best != NONE) {
                 grabbed = best
-                val cx = if (best == BALL) ballX else cubeCX
-                val cy = if (best == BALL) ballY else cubeCY
-                grabOffsetX = cx - pinchX[bestIdx]
-                grabOffsetY = cy - pinchY[bestIdx]
+                if (best == HANDLE) {
+                    grabOffsetX = barCX - pinchX[bestIdx]
+                    grabOffsetY = barCY - pinchY[bestIdx]
+                } else {
+                    grabOffsetX = iconCX[best] - pinchX[bestIdx]
+                    grabOffsetY = iconCY[best] - pinchY[bestIdx]
+                    if (iconInBar[best]) {
+                        // Puxou o ícone para fora da barra.
+                        iconInBar[best] = false
+                        iconNX[best] = iconCX[best] / iw
+                        iconNY[best] = iconCY[best] / ih
+                    }
+                }
             }
         } else {
             if (pinchCount == 0) {
-                grabbed = NONE   // soltou
+                // Soltou. Se um ícone foi solto em cima da barra, ele volta para o seu lugar.
+                if (grabbed != HANDLE) {
+                    val i = grabbed
+                    val margin = iconS * 0.3f
+                    if (iconCX[i] in (barLeft - margin)..(barLeft + barW + margin) &&
+                        iconCY[i] in (barTop - margin)..(barTop + barH + margin)
+                    ) {
+                        iconInBar[i] = true
+                    }
+                }
+                grabbed = NONE
+                applyGeometry(iw, ih)
             } else {
-                // Segue a pinça mais perto do objeto segurado.
-                val cx = if (grabbed == BALL) ballX else cubeCX
-                val cy = if (grabbed == BALL) ballY else cubeCY
+                // Segue a pinça mais perto da peça segurada.
+                val cx = if (grabbed == HANDLE) barCX else iconCX[grabbed]
+                val cy = if (grabbed == HANDLE) barCY else iconCY[grabbed]
                 var idx = 0
                 var bestDist = Float.MAX_VALUE
-                for (i in 0 until pinchCount) {
-                    val d = hypot(pinchX[i] - cx, pinchY[i] - cy)
-                    if (d < bestDist) { bestDist = d; idx = i }
+                for (p in 0 until pinchCount) {
+                    val d = hypot(pinchX[p] - cx, pinchY[p] - cy)
+                    if (d < bestDist) { bestDist = d; idx = p }
                 }
-                val nx = ((pinchX[idx] + grabOffsetX) / iw).coerceIn(0.08f, 0.92f)
-                val ny = ((pinchY[idx] + grabOffsetY) / ih).coerceIn(0.10f, 0.90f)
-                if (grabbed == BALL) { ballNX = nx; ballNY = ny } else { cubeNX = nx; cubeNY = ny }
+                val nx = (pinchX[idx] + grabOffsetX) / iw
+                val ny = (pinchY[idx] + grabOffsetY) / ih
+                if (grabbed == HANDLE) {
+                    val halfW = min(barW / 2f / iw, 0.49f)
+                    barNX = nx.coerceIn(halfW, 1f - halfW)
+                    barNY = ny.coerceIn(0.10f, 0.82f)
+                } else {
+                    iconNX[grabbed] = nx.coerceIn(0.05f, 0.95f)
+                    iconNY[grabbed] = ny.coerceIn(0.05f, 0.95f)
+                }
                 applyGeometry(iw, ih)
             }
         }
 
-        ballState = if (grabbed == BALL) 2 else if (ballTouch) 1 else 0
-        cubeState = if (grabbed == CUBE) 2 else if (cubeTouch) 1 else 0
+        for (i in 0 until ICON_COUNT) {
+            iconState[i] = if (grabbed == i) 2 else if (iconTouch[i]) 1 else 0
+        }
+        handleState = if (grabbed == HANDLE) 2 else if (handleTouch) 1 else 0
     }
 
-    /** Desenha (imagem opcional +) objetos + esqueleto dentro de uma região da tela. */
+    /** Desenha (imagem opcional +) barra + esqueleto dentro de uma região da tela. */
     private fun drawRegion(
         canvas: Canvas,
         left: Float,
@@ -278,11 +348,14 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             canvas.save()
             canvas.translate(offsetX, offsetY)
             canvas.scale(scale, scale)
-            drawBall(canvas)
-            drawCube(canvas)
+            drawBar(canvas)
+            // Ícones na barra, depois os soltos, e o segurado por último (fica por cima).
+            for (i in 0 until ICON_COUNT) if (iconInBar[i] && grabbed != i) drawIcon(canvas, i)
+            for (i in 0 until ICON_COUNT) if (!iconInBar[i] && grabbed != i) drawIcon(canvas, i)
+            if (grabbed in 0 until ICON_COUNT) drawIcon(canvas, grabbed)
             // Anel amarelo no ponto onde a pinça está fechada.
-            for (i in 0 until pinchCount) {
-                canvas.drawCircle(pinchX[i], pinchY[i], max(ballR * 0.35f, 8f), pinchPaint)
+            for (p in 0 until pinchCount) {
+                canvas.drawCircle(pinchX[p], pinchY[p], max(iconS * 0.25f, 8f), pinchPaint)
             }
             canvas.restore()
         }
@@ -309,71 +382,44 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         }
     }
 
-    private fun drawBall(canvas: Canvas) {
-        objectPaint.color = when (ballState) {
-            2 -> Color.rgb(30, 136, 229)
-            1 -> Color.rgb(67, 160, 71)
-            else -> Color.rgb(229, 57, 53)
-        }
-        canvas.drawCircle(ballX, ballY, ballR, objectPaint)
-        canvas.drawCircle(ballX, ballY, ballR, outlinePaint)
-        // Brilho para parecer uma esfera.
-        objectPaint.color = Color.argb(120, 255, 255, 255)
-        canvas.drawCircle(ballX - ballR * 0.3f, ballY - ballR * 0.3f, ballR * 0.3f, objectPaint)
+    private fun drawBar(canvas: Canvas) {
+        // Fundo da barra (escuro e meio transparente).
+        fillPaint.color = Color.argb(130, 30, 30, 30)
+        rect.set(barLeft, barTop, barLeft + barW, barTop + barH)
+        val r = gap * 1.6f
+        canvas.drawRoundRect(rect, r, r, fillPaint)
+
+        // Barrinha branca embaixo: serve para mover a barra.
+        val h = if (handleState == 0) handleH else handleH * 1.8f
+        fillPaint.color = if (handleState == 2) Color.YELLOW else Color.WHITE
+        rect.set(handleCX - handleW / 2f, handleCY - h / 2f, handleCX + handleW / 2f, handleCY + h / 2f)
+        canvas.drawRoundRect(rect, h / 2f, h / 2f, fillPaint)
     }
 
-    private fun drawCube(canvas: Canvas) {
-        val front: Int
-        val top: Int
-        val side: Int
-        when (cubeState) {
-            2 -> {
-                front = Color.rgb(30, 136, 229)
-                top = Color.rgb(100, 181, 246)
-                side = Color.rgb(21, 101, 192)
-            }
-            1 -> {
-                front = Color.rgb(67, 160, 71)
-                top = Color.rgb(129, 199, 132)
-                side = Color.rgb(46, 125, 50)
-            }
-            else -> {
-                front = Color.rgb(255, 152, 0)
-                top = Color.rgb(255, 183, 77)
-                side = Color.rgb(230, 81, 0)
-            }
+    private fun drawIcon(canvas: Canvas, i: Int) {
+        val state = iconState[i]
+        val grow = when (state) {
+            2 -> 1.2f
+            1 -> 1.1f
+            else -> 1f
         }
-        val x = cubeX
-        val y = cubeY
-        val s = cubeS
-        val d = cubeD
+        val half = iconS / 2f * grow
+        val cx = iconCX[i]
+        val cy = iconCY[i]
+        val radius = half * 0.5f
 
-        // Face da frente.
-        objectPaint.color = front
-        canvas.drawRect(x, y, x + s, y + s, objectPaint)
-        canvas.drawRect(x, y, x + s, y + s, outlinePaint)
+        rect.set(cx - half, cy - half, cx + half, cy + half)
+        fillPaint.color = iconColors[i]
+        canvas.drawRoundRect(rect, radius, radius, fillPaint)
+        canvas.drawRoundRect(rect, radius, radius, outlinePaint)
 
-        // Face de cima.
-        objectPaint.color = top
-        facePath.reset()
-        facePath.moveTo(x, y)
-        facePath.lineTo(x + s, y)
-        facePath.lineTo(x + s + d, y - d)
-        facePath.lineTo(x + d, y - d)
-        facePath.close()
-        canvas.drawPath(facePath, objectPaint)
-        canvas.drawPath(facePath, outlinePaint)
-
-        // Face da direita.
-        objectPaint.color = side
-        facePath.reset()
-        facePath.moveTo(x + s, y)
-        facePath.lineTo(x + s + d, y - d)
-        facePath.lineTo(x + s + d, y + s - d)
-        facePath.lineTo(x + s, y + s)
-        facePath.close()
-        canvas.drawPath(facePath, objectPaint)
-        canvas.drawPath(facePath, outlinePaint)
+        if (state == 1) {
+            // Acende quando o dedo encosta.
+            fillPaint.color = Color.argb(70, 255, 255, 255)
+            canvas.drawRoundRect(rect, radius, radius, fillPaint)
+        } else if (state == 2) {
+            canvas.drawRoundRect(rect, radius, radius, grabRingPaint)
+        }
     }
 
     private companion object {
@@ -388,9 +434,9 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val PINCH_START = 0.30f
         const val PINCH_RELEASE = 0.45f
 
+        const val ICON_COUNT = 3
         const val MAX_HANDS = 4
-        const val NONE = 0
-        const val BALL = 1
-        const val CUBE = 2
+        const val NONE = -1
+        const val HANDLE = ICON_COUNT   // alvo "barrinha de mover a barra"
     }
 }
