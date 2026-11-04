@@ -8,6 +8,7 @@ import android.graphics.Paint
 import android.graphics.RectF
 import android.os.SystemClock
 import android.util.AttributeSet
+import android.view.MotionEvent
 import android.view.View
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
@@ -23,6 +24,8 @@ import kotlin.math.min
  *  - Os ícones ficam sempre no lugar (não dá para arrastar).
  *  - Pinça na barrinha branca embaixo da barra: move a barra inteira.
  *  - Pinça na barrinha branca embaixo de um menu: move só aquele menu.
+ *  - Menu vermelho (modo normal): mostra o YouTube; a pinça funciona como o dedo na tela
+ *    (pinça rápida = clique, pinça e arrastar = rolar).
  * No modo VR Box também desenha a imagem da câmera e repete tudo para os dois olhos.
  */
 class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs) {
@@ -151,6 +154,16 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     private val pinchY = FloatArray(MAX_HANDS)
     private var pinchCount = 0
 
+    // ---- YouTube dentro do menu vermelho (só no modo normal) ----
+    /** Avisa a tela onde o YouTube deve ficar: (visível, x, y, largura, altura, raio), em pixels da view. */
+    var onWebPanel: ((Boolean, Float, Float, Float, Float, Float) -> Unit)? = null
+    /** Envia a pinça como toque para o YouTube: (ação do MotionEvent, x, y) em pixels do YouTube. */
+    var onWebTouch: ((Int, Float, Float) -> Unit)? = null
+    private var touchScale = 1f      // pixels da view por pixel da imagem (modo normal)
+    private var lastWebPX = 0f       // última posição do toque no YouTube (pixels da imagem)
+    private var lastWebPY = 0f
+    private var panelCorner = 0f
+
     fun setResults(newResult: HandLandmarkerResult?, width: Int, height: Int) {
         result = newResult
         imageWidth = width
@@ -177,6 +190,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         val bmp = if (vrMode) frame else null
         val iw = (bmp?.width ?: imageWidth).toFloat()
         val ih = (bmp?.height ?: imageHeight).toFloat()
+        touchScale = min(width / iw, height / ih)
         updateScene(iw, ih)
 
         if (vrMode) {
@@ -187,6 +201,31 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         } else {
             drawRegion(canvas, 0f, width.toFloat(), height.toFloat(), null, iw, ih)
         }
+
+        notifyWebPanel(iw, ih)
+    }
+
+    /** O menu vermelho mostra o YouTube, mas só no modo normal. */
+    private fun isWebPanel(): Boolean = !vrMode && openMenu == YOUTUBE_ICON
+
+    /** Diz para a tela onde colocar (ou esconder) o YouTube. */
+    private fun notifyWebPanel(iw: Float, ih: Float) {
+        val cb = onWebPanel ?: return
+        if (!sceneReady || !isWebPanel()) {
+            cb(false, 0f, 0f, 0f, 0f, 0f)
+            return
+        }
+        val scale = min(width / iw, height / ih)
+        val offsetX = (width - iw * scale) / 2f
+        val offsetY = (height - ih * scale) / 2f
+        cb(
+            true,
+            offsetX + panelLeft * scale,
+            offsetY + panelTop * scale,
+            panelW * scale,
+            panelH * scale,
+            panelCorner * scale
+        )
     }
 
     /** Converte as posições (0 a 1) em pixels da imagem e calcula o tamanho de cada peça. */
@@ -212,8 +251,15 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
         // Menu aberto.
         val margin = u * 0.03f
-        panelW = min(u * 0.62f, iw * 0.9f)
-        panelH = u * 0.30f
+        if (isWebPanel()) {
+            // Menu do YouTube: maior, para caber a página.
+            panelW = iw * 0.92f
+            panelH = ih * 0.36f
+        } else {
+            panelW = min(u * 0.62f, iw * 0.9f)
+            panelH = u * 0.30f
+        }
+        panelCorner = gap * 1.6f
         pHandleW = panelW * 0.5f
         val m = openMenu
         if (m != NONE) {
@@ -322,6 +368,18 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     if (d < bestDist) { best = PANEL_HANDLE; bestDist = d; bestIdx = p }
                 }
             }
+            if (best == NONE && isWebPanel()) {
+                // Pinça dentro do YouTube: funciona como o dedo na tela.
+                for (p in 0 until pinchCount) {
+                    if (pinchX[p] in panelLeft..(panelLeft + panelW) &&
+                        pinchY[p] in panelTop..(panelTop + panelH)
+                    ) {
+                        best = PANEL_CONTENT
+                        bestIdx = p
+                        break
+                    }
+                }
+            }
             if (best != NONE) {
                 grabbed = best
                 grabStartTime = SystemClock.uptimeMillis()
@@ -337,6 +395,17 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                         grabOffsetX = panelLeft + panelW / 2f - pinchX[bestIdx]
                         grabOffsetY = panelTop + panelH / 2f - pinchY[bestIdx]
                     }
+                    PANEL_CONTENT -> {
+                        grabOffsetX = 0f
+                        grabOffsetY = 0f
+                        lastWebPX = pinchX[bestIdx]
+                        lastWebPY = pinchY[bestIdx]
+                        onWebTouch?.invoke(
+                            MotionEvent.ACTION_DOWN,
+                            (lastWebPX - panelLeft) * touchScale,
+                            (lastWebPY - panelTop) * touchScale
+                        )
+                    }
                     else -> {
                         grabOffsetX = 0f
                         grabOffsetY = 0f
@@ -350,6 +419,13 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     SystemClock.uptimeMillis() - grabStartTime <= TAP_MAX_MS
                 ) {
                     openMenu = if (openMenu == grabbed) NONE else grabbed
+                }
+                if (grabbed == PANEL_CONTENT) {
+                    onWebTouch?.invoke(
+                        MotionEvent.ACTION_UP,
+                        (lastWebPX - panelLeft) * touchScale,
+                        (lastWebPY - panelTop) * touchScale
+                    )
                 }
                 grabbed = NONE
                 applyGeometry(iw, ih)
@@ -365,6 +441,10 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     PANEL_HANDLE -> {
                         expectedX = panelLeft + panelW / 2f - grabOffsetX
                         expectedY = panelTop + panelH / 2f - grabOffsetY
+                    }
+                    PANEL_CONTENT -> {
+                        expectedX = lastWebPX
+                        expectedY = lastWebPY
                     }
                     else -> {
                         expectedX = grabStartX
@@ -393,6 +473,15 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                             panelNX[m] = ((pinchX[idx] + grabOffsetX) / iw).coerceIn(0f, 1f)
                             panelNY[m] = ((pinchY[idx] + grabOffsetY) / ih).coerceIn(0f, 1f)
                         }
+                    }
+                    PANEL_CONTENT -> {
+                        lastWebPX = pinchX[idx].coerceIn(panelLeft, panelLeft + panelW)
+                        lastWebPY = pinchY[idx].coerceIn(panelTop, panelTop + panelH)
+                        onWebTouch?.invoke(
+                            MotionEvent.ACTION_MOVE,
+                            (lastWebPX - panelLeft) * touchScale,
+                            (lastWebPY - panelTop) * touchScale
+                        )
                     }
                     else -> {
                         // Segurando um ícone: ele não se move; se a mão se afastar, cancela o toque.
@@ -501,8 +590,10 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         if (m == NONE) return
         rect.set(panelLeft, panelTop, panelLeft + panelW, panelTop + panelH)
         val r = gap * 1.6f
-        fillPaint.color = Color.argb(150, 20, 20, 20)
-        canvas.drawRoundRect(rect, r, r, fillPaint)
+        if (!isWebPanel()) {
+            fillPaint.color = Color.argb(150, 20, 20, 20)
+            canvas.drawRoundRect(rect, r, r, fillPaint)
+        }
         // Borda com a cor do ícone que abriu o menu.
         panelBorderPaint.color = iconColors[m]
         canvas.drawRoundRect(rect, r, r, panelBorderPaint)
@@ -553,9 +644,11 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val DRAG_START = 0.4f     // quanto a mão pode se afastar (em tamanhos de ícone) e ainda ser toque
 
         const val ICON_COUNT = 3
+        const val YOUTUBE_ICON = 1   // o ícone vermelho abre o YouTube
         const val MAX_HANDS = 4
         const val NONE = -1
         const val HANDLE = ICON_COUNT          // barrinha que move a barra
         const val PANEL_HANDLE = ICON_COUNT + 1  // barrinha que move o menu aberto
+        const val PANEL_CONTENT = ICON_COUNT + 2 // pinça dentro do YouTube (clicar/rolar)
     }
 }
