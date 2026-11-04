@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.RectF
 import android.os.SystemClock
 import android.util.AttributeSet
@@ -169,6 +170,14 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     private var lastWebPY = 0f
     private var panelCorner = 0f
 
+    // ---- YouTube no modo VR Box (desenhado por nós, uma vez para cada olho) ----
+    /** Pede para ligar/desligar o YouTube "virtual" (quem faz isso é a MainActivity). */
+    var onVrWebWanted: ((Boolean) -> Unit)? = null
+    /** Pinça -> toque no YouTube virtual: (ação, x, y) em pixels do YouTube virtual. */
+    var onVrWebTouch: ((Int, Float, Float) -> Unit)? = null
+    @Volatile private var webFrame: Bitmap? = null
+    private val webSrc = Rect(0, 0, WebTexture.WIDTH, WebTexture.HEIGHT)
+
     // ---- Modo 3D ("mundo"): a barra e os menus ficam parados no espaço, usando o giroscópio ----
     /** true = usa o giroscópio (só com a câmera traseira). false = tudo preso na tela, como antes. */
     @Volatile var worldMode: Boolean = false
@@ -200,6 +209,12 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     fun setFrame(bitmap: Bitmap, rotation: FloatArray? = null) {
         frame = bitmap
         frameRot = rotation
+        postInvalidate()
+    }
+
+    /** Último quadro do YouTube virtual (modo VR Box). */
+    fun setWebFrame(bitmap: Bitmap?) {
+        webFrame = bitmap
         postInvalidate()
     }
 
@@ -331,11 +346,31 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         notifyWebPanel(iw, ih)
     }
 
-    /** O menu vermelho mostra o YouTube, mas só no modo normal. */
-    private fun isWebPanel(): Boolean = !vrMode && openMenu == YOUTUBE_ICON
+    /** O menu vermelho mostra o YouTube (nos dois modos). */
+    private fun isWebOpen(): Boolean = openMenu == YOUTUBE_ICON
+
+    /** Modo normal: o YouTube é uma tela de verdade (WebView) por cima da imagem. */
+    private fun isWebPanel(): Boolean = !vrMode && isWebOpen()
+
+    /** Modo VR Box: o YouTube é desenhado por nós, uma vez para cada olho. */
+    private fun isVrWeb(): Boolean = vrMode && isWebOpen()
+
+    /** Manda a pinça como toque para o YouTube (o de verdade ou o virtual do VR Box). */
+    private fun emitWebTouch(action: Int, px: Float, py: Float) {
+        if (vrMode) {
+            onVrWebTouch?.invoke(
+                action,
+                (px - panelLeft) / panelW * WebTexture.WIDTH,
+                (py - panelTop) / panelH * WebTexture.HEIGHT
+            )
+        } else {
+            onWebTouch?.invoke(action, (px - panelLeft) * touchScale, (py - panelTop) * touchScale)
+        }
+    }
 
     /** Diz para a tela onde colocar (ou esconder) o YouTube. */
     private fun notifyWebPanel(iw: Float, ih: Float) {
+        onVrWebWanted?.invoke(sceneReady && isVrWeb())
         val cb = onWebPanel ?: return
         if (!sceneReady || !isWebPanel()) {
             cb(false, 0f, 0f, 0f, 0f, 0f)
@@ -388,9 +423,16 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         // Menu aberto.
         val margin = u * 0.03f
         if (isWebPanel()) {
-            // Menu do YouTube: maior, para caber a página.
+            // Menu do YouTube (modo normal): maior, para caber a página.
             panelW = iw * 0.92f
             panelH = ih * 0.36f
+        } else if (isVrWeb()) {
+            // YouTube no VR Box: janela no formato do vídeo (16:9), do tamanho que couber acima da barra.
+            val aspect = WebTexture.HEIGHT.toFloat() / WebTexture.WIDTH
+            val room = barTop - gap * 3.2f - margin
+            panelH = min(u * 0.45f, max(room, u * 0.2f))
+            panelW = min(panelH / aspect, iw * 0.9f)
+            panelH = panelW * aspect
         } else {
             panelW = min(u * 0.62f, iw * 0.9f)
             panelH = u * 0.30f
@@ -527,7 +569,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     if (d < bestDist) { best = PANEL_HANDLE; bestDist = d; bestIdx = p }
                 }
             }
-            if (best == NONE && isWebPanel()) {
+            if (best == NONE && isWebOpen()) {
                 // Pinça dentro do YouTube: funciona como o dedo na tela.
                 for (p in 0 until pinchCount) {
                     if (pinchX[p] in panelLeft..(panelLeft + panelW) &&
@@ -559,11 +601,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                         grabOffsetY = 0f
                         lastWebPX = pinchX[bestIdx]
                         lastWebPY = pinchY[bestIdx]
-                        onWebTouch?.invoke(
-                            MotionEvent.ACTION_DOWN,
-                            (lastWebPX - panelLeft) * touchScale,
-                            (lastWebPY - panelTop) * touchScale
-                        )
+                        emitWebTouch(MotionEvent.ACTION_DOWN, lastWebPX, lastWebPY)
                     }
                     else -> {
                         grabOffsetX = 0f
@@ -580,11 +618,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     openMenu = if (openMenu == grabbed) NONE else grabbed
                 }
                 if (grabbed == PANEL_CONTENT) {
-                    onWebTouch?.invoke(
-                        MotionEvent.ACTION_UP,
-                        (lastWebPX - panelLeft) * touchScale,
-                        (lastWebPY - panelTop) * touchScale
-                    )
+                    emitWebTouch(MotionEvent.ACTION_UP, lastWebPX, lastWebPY)
                 }
                 grabbed = NONE
                 applyGeometry(iw, ih)
@@ -646,11 +680,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     PANEL_CONTENT -> {
                         lastWebPX = pinchX[idx].coerceIn(panelLeft, panelLeft + panelW)
                         lastWebPY = pinchY[idx].coerceIn(panelTop, panelTop + panelH)
-                        onWebTouch?.invoke(
-                            MotionEvent.ACTION_MOVE,
-                            (lastWebPX - panelLeft) * touchScale,
-                            (lastWebPY - panelTop) * touchScale
-                        )
+                        emitWebTouch(MotionEvent.ACTION_MOVE, lastWebPX, lastWebPY)
                     }
                     else -> {
                         // Segurando um ícone: ele não se move; se a mão se afastar, cancela o toque.
@@ -759,7 +789,16 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         if (m == NONE) return
         rect.set(panelLeft, panelTop, panelLeft + panelW, panelTop + panelH)
         val r = gap * 1.6f
-        if (!isWebPanel()) {
+        if (isVrWeb()) {
+            // YouTube do modo VR Box: desenha o último quadro (ou preto, enquanto carrega).
+            val webBmp = webFrame
+            if (webBmp != null) {
+                canvas.drawBitmap(webBmp, webSrc, rect, framePaint)
+            } else {
+                fillPaint.color = Color.BLACK
+                canvas.drawRect(rect, fillPaint)
+            }
+        } else if (!isWebPanel()) {
             fillPaint.color = Color.argb(150, 20, 20, 20)
             canvas.drawRoundRect(rect, r, r, fillPaint)
         }
