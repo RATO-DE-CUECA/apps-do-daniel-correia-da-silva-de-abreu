@@ -58,6 +58,12 @@ class MainActivity : AppCompatActivity() {
     private var sensorManager: SensorManager? = null
     private var rotationSensor: Sensor? = null
     private var hasRotationSensor = false
+
+    // Sem giroscópio: usa a câmera (quanto a imagem deslizou) + o acelerômetro (onde fica o chão).
+    private val visual = VisualOrientation()
+    private var useVisual = false
+    private var accelSensor: Sensor? = null
+    private var pixelBuffer = IntArray(0)
     private val rotationMatrix = FloatArray(9)
     private val rotationValues = FloatArray(4)
     private val sensorListener = object : SensorEventListener {
@@ -69,6 +75,14 @@ class MainActivity : AppCompatActivity() {
             }
             SensorManager.getRotationMatrixFromVector(rotationMatrix, values)
             overlay.setGyro(rotationMatrix.clone())
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
+
+    private val accelListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            visual.onAccel(event.values[0], event.values[1], event.values[2])
         }
 
         override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
@@ -117,6 +131,8 @@ class MainActivity : AppCompatActivity() {
         override fun onDisplayChanged(displayId: Int) {
             analysis?.targetRotation = currentRotation()
             overlay.setDisplayRotation(currentRotation())
+            visual.setDisplayRotation(currentRotation())
+            visual.reset()
         }
     }
 
@@ -180,14 +196,26 @@ class MainActivity : AppCompatActivity() {
     private fun setupSensors() {
         val sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         sensorManager = sm
-        // Sem ímã (bússola): mais estável dentro de casa.
-        // 1º giroscópio (melhor), 2º giroscópio/bússola do Android, 3º só acelerômetro + bússola.
-        rotationSensor = sm.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
-            ?: sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
-            ?: sm.getDefaultSensor(Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR)
-        hasRotationSensor = rotationSensor != null
-        // Aviso rápido para saber qual sensor o seu celular está usando.
-        Toast.makeText(this, "Sensor 3D: " + (rotationSensor?.name ?: "nenhum"), Toast.LENGTH_LONG).show()
+        val hasGyro = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE) != null
+        if (hasGyro) {
+            // Com giroscópio: usa o sensor de rotação do Android (o melhor jeito).
+            rotationSensor = sm.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
+                ?: sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+        }
+        if (rotationSensor == null) {
+            // Sem giroscópio: câmera (quanto a imagem deslizou) + acelerômetro (onde fica o chão).
+            accelSensor = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+            useVisual = accelSensor != null
+        }
+        hasRotationSensor = rotationSensor != null || useVisual
+        // Aviso rápido para saber como o 3D está funcionando neste celular.
+        val how = when {
+            rotationSensor != null -> "giroscópio"
+            useVisual -> "câmera + acelerômetro (sem giroscópio)"
+            else -> "indisponível neste celular"
+        }
+        Toast.makeText(this, "3D: $how", Toast.LENGTH_LONG).show()
+        visual.setDisplayRotation(currentRotation())
         overlay.setDisplayRotation(currentRotation())
 
         centerButton = findViewById(R.id.centerButton)
@@ -272,6 +300,7 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
         webView.onPause()
         sensorManager?.unregisterListener(sensorListener)
+        sensorManager?.unregisterListener(accelListener)
     }
 
     override fun onResume() {
@@ -281,6 +310,11 @@ class MainActivity : AppCompatActivity() {
         if (sensor != null) {
             sensorManager?.registerListener(sensorListener, sensor, SensorManager.SENSOR_DELAY_GAME)
         }
+        val accel = accelSensor
+        if (useVisual && accel != null) {
+            sensorManager?.registerListener(accelListener, accel, SensorManager.SENSOR_DELAY_GAME)
+        }
+        visual.reset()
     }
 
     private fun orientationForMode(): Int =
@@ -341,6 +375,7 @@ class MainActivity : AppCompatActivity() {
     private fun startCamera() {
         // Modo 3D (menu parado no espaço) só funciona com a câmera traseira.
         overlay.worldMode = hasRotationSensor && lensFacing == CameraSelector.LENS_FACING_BACK
+        visual.reset()
 
         val providerFuture = ProcessCameraProvider.getInstance(this)
         providerFuture.addListener({
@@ -417,8 +452,21 @@ class MainActivity : AppCompatActivity() {
         transform.postTranslate(outW / 2f, outH / 2f)
         Canvas(prepared).drawBitmap(frame, transform, null)
 
+        // Orientação deste quadro: do giroscópio, ou (sem giroscópio) calculada pela própria imagem.
+        var frameRotation = overlay.currentRotation()
+        if (useVisual && overlay.worldMode) {
+            val count = outW * outH
+            if (pixelBuffer.size != count) pixelBuffer = IntArray(count)
+            prepared.getPixels(pixelBuffer, 0, outW, 0, 0, outW, outH)
+            val r = visual.onFrame(pixelBuffer, outW, outH, overlay.handBoxes())
+            if (r != null) {
+                overlay.setGyro(r)
+                frameRotation = r
+            }
+        }
+
         // No VR Box, manda o frame para a tela desenhar nos dois olhos.
-        if (vrMode) overlay.setFrame(prepared, overlay.currentRotation())
+        if (vrMode) overlay.setFrame(prepared, frameRotation)
 
         landmarker.detectAsync(BitmapImageBuilder(prepared).build(), SystemClock.uptimeMillis())
     }
