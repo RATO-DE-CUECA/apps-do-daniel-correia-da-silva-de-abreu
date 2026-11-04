@@ -211,6 +211,34 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
     fun currentRotation(): FloatArray? = liveRot
 
+    /**
+     * Retângulos das mãos na última detecção: (minX, minY, maxX, maxY) de 0 a 1, um para cada mão.
+     * O rastreador por câmera usa isso para ignorar as mãos (elas se mexem sozinhas).
+     */
+    fun handBoxes(): FloatArray? {
+        val res = result ?: return null
+        val hands = res.landmarks()
+        if (hands.isEmpty()) return null
+        val out = FloatArray(hands.size * 4)
+        for ((i, hand) in hands.withIndex()) {
+            var minX = 1f
+            var minY = 1f
+            var maxX = 0f
+            var maxY = 0f
+            for (p in hand) {
+                minX = min(minX, p.x())
+                minY = min(minY, p.y())
+                maxX = max(maxX, p.x())
+                maxY = max(maxY, p.y())
+            }
+            out[i * 4] = minX
+            out[i * 4 + 1] = minY
+            out[i * 4 + 2] = maxX
+            out[i * 4 + 3] = maxY
+        }
+        return out
+    }
+
     /** Rotação da tela (Surface.ROTATION_*): diz onde ficam a direita e o cima da tela no aparelho. */
     fun setDisplayRotation(rotation: Int) {
         when (rotation) {
