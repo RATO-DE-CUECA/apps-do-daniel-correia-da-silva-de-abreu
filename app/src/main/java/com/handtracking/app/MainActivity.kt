@@ -1,654 +1,387 @@
 package com.handtracking.app
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.RectF
+import android.graphics.Matrix
+import android.graphics.Outline
+import android.hardware.display.DisplayManager
 import android.os.SystemClock
-import android.util.AttributeSet
+import android.os.Bundle
 import android.view.MotionEvent
+import android.view.Surface
 import android.view.View
+import android.view.ViewOutlineProvider
+import android.view.WindowManager
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Button
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.AspectRatio
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.content.ContextCompat
+import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.core.Delegate
+import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
-import kotlin.math.abs
-import kotlin.math.hypot
-import kotlin.math.max
-import kotlin.math.min
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
-/**
- * Desenha o esqueleto da mão e uma barra flutuante com 3 ícones (verde, vermelho e azul).
- *  - Encostar o dedo indicador num ícone: ele cresce um pouco e acende.
- *  - Pinça rápida (fechar e abrir os dedos) num ícone: abre (ou fecha) o menu daquele ícone.
- *  - Os ícones ficam sempre no lugar (não dá para arrastar).
- *  - Pinça na barrinha branca embaixo da barra: move a barra inteira.
- *  - Pinça na barrinha branca embaixo de um menu: move só aquele menu.
- *  - Menu vermelho (modo normal): mostra o YouTube; a pinça funciona como o dedo na tela
- *    (pinça rápida = clique, pinça e arrastar = rolar).
- * No modo VR Box também desenha a imagem da câmera e repete tudo para os dois olhos.
- */
-class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs) {
+class MainActivity : AppCompatActivity() {
 
-    @Volatile private var result: HandLandmarkerResult? = null
-    @Volatile private var imageWidth = 1
-    @Volatile private var imageHeight = 1
-    @Volatile private var frame: Bitmap? = null
+    private lateinit var previewView: PreviewView
+    private lateinit var overlay: HandOverlayView
+    private lateinit var modeButton: Button
+    private lateinit var flipButton: Button
+    private lateinit var webView: WebView
 
-    /** true = tela dividida (VR Box); false = modo normal (só o esqueleto por cima do preview). */
-    @Volatile var vrMode: Boolean = false
-        set(value) {
-            field = value
-            postInvalidate()
+    // YouTube dentro do menu vermelho (só no modo normal).
+    private var webShown = false
+    private var webLoaded = false
+    private var webX = 0f
+    private var webY = 0f
+    private var webW = 0f
+    private var webH = 0f
+    private var webR = 0f
+    private var webOutlineRadius = 0f
+    private var webDownTime = 0L
+    private lateinit var cameraExecutor: ExecutorService
+
+    private var handLandmarker: HandLandmarker? = null
+
+    // true = modo VR Box (tela dividida, câmera traseira, tela deitada).
+    // Para o app abrir direto no modo normal, troque este valor padrão para false.
+    @Volatile private var vrMode = true
+    private var lensFacing = CameraSelector.LENS_FACING_BACK
+
+    @Volatile private var analysis: ImageAnalysis? = null
+
+    // Bitmaps e matriz reaproveitados a cada frame (evita alocar memória 30x por segundo).
+    // São 2 bitmaps de saída que se alternam, para a tela não desenhar um frame
+    // enquanto ele está sendo reescrito.
+    private var frameBitmap: Bitmap? = null
+    private val frameBuffers = arrayOfNulls<Bitmap>(2)
+    private var frameBufferIndex = 0
+    private val transform = Matrix()
+
+    private val permissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) startCamera() else {
+                Toast.makeText(this, R.string.permission_denied, Toast.LENGTH_LONG).show()
+            }
         }
 
-    private val linePaint = Paint().apply {
-        color = Color.WHITE
-        strokeWidth = 6f
-        isAntiAlias = true
-        style = Paint.Style.STROKE
-    }
-    private val pointPaint = Paint().apply {
-        color = Color.rgb(30, 60, 255)
-        strokeWidth = 6f
-        isAntiAlias = true
-        style = Paint.Style.FILL
-    }
-    private val framePaint = Paint(Paint.FILTER_BITMAP_FLAG)
-    private val dividerPaint = Paint().apply {
-        color = Color.DKGRAY
-        strokeWidth = 4f
-    }
-    private val frameRect = RectF()
-
-    // ---- Barra de ícones e menus ----
-    private val fillPaint = Paint().apply {
-        isAntiAlias = true
-        style = Paint.Style.FILL
-    }
-    private val outlinePaint = Paint().apply {
-        isAntiAlias = true
-        style = Paint.Style.STROKE
-        strokeWidth = 3f
-        color = Color.argb(140, 0, 0, 0)
-    }
-    private val pressRingPaint = Paint().apply {
-        isAntiAlias = true
-        style = Paint.Style.STROKE
-        strokeWidth = 5f
-        color = Color.WHITE
-    }
-    private val panelBorderPaint = Paint().apply {
-        isAntiAlias = true
-        style = Paint.Style.STROKE
-        strokeWidth = 6f
-    }
-    private val pinchPaint = Paint().apply {
-        isAntiAlias = true
-        style = Paint.Style.STROKE
-        strokeWidth = 4f
-        color = Color.YELLOW
-    }
-    private val rect = RectF()
-
-    private val iconColors = intArrayOf(
-        Color.rgb(67, 160, 71),   // verde
-        Color.rgb(229, 57, 53),   // vermelho
-        Color.rgb(30, 136, 229)   // azul
-    )
-
-    // Posição do CENTRO da barra, de 0 a 1 (fração da imagem da câmera).
-    // Altura: 0 = topo da imagem, 1 = embaixo. (0.55 = meio da tela)
-    private var barNX = 0.5f
-    private var barNY = 0.55f
-
-    // Menu aberto (índice do ícone) ou NONE. Só um menu fica aberto por vez.
-    private var openMenu = NONE
-
-    // Cada menu lembra a própria posição depois que você o move (centro, de 0 a 1).
-    // Enquanto não foi movido, ele aparece em cima da barra e acompanha a barra.
-    private val panelMoved = BooleanArray(ICON_COUNT)
-    private val panelNX = FloatArray(ICON_COUNT)
-    private val panelNY = FloatArray(ICON_COUNT)
-
-    // Geometria em pixels da imagem da câmera (recalculada a cada desenho).
-    private var sceneReady = false
-    private var iconS = 0f
-    private var gap = 0f
-    private var barW = 0f
-    private var barH = 0f
-    private var barCX = 0f
-    private var barCY = 0f
-    private var barLeft = 0f
-    private var barTop = 0f
-    private var handleCX = 0f
-    private var handleCY = 0f
-    private var handleW = 0f
-    private var handleH = 0f
-    private val iconCX = FloatArray(ICON_COUNT)
-    private val iconCY = FloatArray(ICON_COUNT)
-
-    private var panelW = 0f
-    private var panelH = 0f
-    private var panelLeft = 0f
-    private var panelTop = 0f
-    private var pHandleCX = 0f
-    private var pHandleCY = 0f
-    private var pHandleW = 0f
-
-    // Estado: 0 = normal, 1 = dedo encostando, 2 = segurado.
-    private val iconState = IntArray(ICON_COUNT)
-    private val iconTouch = BooleanArray(ICON_COUNT)
-    private var handleState = 0
-    private var pHandleState = 0
-
-    // Pinça (pegar).
-    private var grabbed = NONE
-    private var grabOffsetX = 0f
-    private var grabOffsetY = 0f
-    private var tapCancelled = false   // true = a mão se afastou, então não conta como toque
-    private var grabStartTime = 0L
-    private var grabStartX = 0f
-    private var grabStartY = 0f
-    private val pinchX = FloatArray(MAX_HANDS)
-    private val pinchY = FloatArray(MAX_HANDS)
-    private var pinchCount = 0
-
-    // ---- YouTube dentro do menu vermelho (só no modo normal) ----
-    /** Avisa a tela onde o YouTube deve ficar: (visível, x, y, largura, altura, raio), em pixels da view. */
-    var onWebPanel: ((Boolean, Float, Float, Float, Float, Float) -> Unit)? = null
-    /** Envia a pinça como toque para o YouTube: (ação do MotionEvent, x, y) em pixels do YouTube. */
-    var onWebTouch: ((Int, Float, Float) -> Unit)? = null
-    private var touchScale = 1f      // pixels da view por pixel da imagem (modo normal)
-    private var lastWebPX = 0f       // última posição do toque no YouTube (pixels da imagem)
-    private var lastWebPY = 0f
-    private var panelCorner = 0f
-
-    fun setResults(newResult: HandLandmarkerResult?, width: Int, height: Int) {
-        result = newResult
-        imageWidth = width
-        imageHeight = height
-        postInvalidate()
+    // Se a tela girar de um lado deitado para o outro, avisa a câmera.
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+        override fun onDisplayChanged(displayId: Int) {
+            analysis?.targetRotation = currentRotation()
+        }
     }
 
-    /** Usado só no modo VR Box: último frame da câmera (já girado/espelhado). */
-    fun setFrame(bitmap: Bitmap) {
-        frame = bitmap
-        postInvalidate()
-    }
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
 
-    fun clear() {
-        result = null
-        frame = null
-        grabbed = NONE
-        postInvalidate()
-    }
+        vrMode = savedInstanceState?.getBoolean(KEY_VR_MODE, true) ?: true
+        lensFacing = savedInstanceState?.getInt(KEY_LENS, CameraSelector.LENS_FACING_BACK)
+            ?: CameraSelector.LENS_FACING_BACK
+        requestedOrientation = orientationForMode()
 
-    override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
+        setContentView(R.layout.activity_main)
+        // Mantém a tela acesa (dentro do VR Box você não toca na tela).
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        val bmp = if (vrMode) frame else null
-        val iw = (bmp?.width ?: imageWidth).toFloat()
-        val ih = (bmp?.height ?: imageHeight).toFloat()
-        touchScale = min(width / iw, height / ih)
-        updateScene(iw, ih)
+        previewView = findViewById(R.id.previewView)
+        previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
+        overlay = findViewById(R.id.overlay)
+        modeButton = findViewById(R.id.modeButton)
+        setupWebView()
+        cameraExecutor = Executors.newSingleThreadExecutor()
 
-        if (vrMode) {
-            val half = width / 2f
-            drawRegion(canvas, 0f, half, height.toFloat(), bmp, iw, ih)     // olho esquerdo
-            drawRegion(canvas, half, half, height.toFloat(), bmp, iw, ih)   // olho direito
-            canvas.drawLine(half, 0f, half, height.toFloat(), dividerPaint)
-        } else {
-            drawRegion(canvas, 0f, width.toFloat(), height.toFloat(), null, iw, ih)
+        flipButton = findViewById(R.id.flipButton)
+        flipButton.setOnClickListener {
+            lensFacing = if (lensFacing == CameraSelector.LENS_FACING_FRONT)
+                CameraSelector.LENS_FACING_BACK else CameraSelector.LENS_FACING_FRONT
+            overlay.clear()
+            startCamera()
         }
 
-        notifyWebPanel(iw, ih)
+        // Botão do cantinho: alterna entre VR Box (tela dividida) e modo normal.
+        modeButton.setOnClickListener {
+            vrMode = !vrMode
+            // VR Box usa a câmera traseira; o modo normal volta para a frontal.
+            lensFacing = if (vrMode) CameraSelector.LENS_FACING_BACK
+            else CameraSelector.LENS_FACING_FRONT
+            requestedOrientation = orientationForMode()
+            applyModeUi()
+            startCamera()
+        }
+
+        applyModeUi()
+
+        (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
+            .registerDisplayListener(displayListener, null)
+
+        setupHandLandmarker()
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+            == PackageManager.PERMISSION_GRANTED
+        ) startCamera() else permissionLauncher.launch(Manifest.permission.CAMERA)
     }
 
-    /** O menu vermelho mostra o YouTube, mas só no modo normal. */
-    private fun isWebPanel(): Boolean = !vrMode && openMenu == YOUTUBE_ICON
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(KEY_VR_MODE, vrMode)
+        outState.putInt(KEY_LENS, lensFacing)
+    }
 
-    /** Diz para a tela onde colocar (ou esconder) o YouTube. */
-    private fun notifyWebPanel(iw: Float, ih: Float) {
-        val cb = onWebPanel ?: return
-        if (!sceneReady || !isWebPanel()) {
-            cb(false, 0f, 0f, 0f, 0f, 0f)
+    private fun setupWebView() {
+        webView = findViewById(R.id.youtubeView)
+        webView.settings.javaScriptEnabled = true
+        webView.settings.domStorageEnabled = true
+        webView.settings.mediaPlaybackRequiresUserGesture = false
+        webView.webViewClient = WebViewClient()
+        webView.webChromeClient = WebChromeClient()
+        webView.setBackgroundColor(Color.BLACK)
+        // Cantos arredondados, igual ao menu.
+        webView.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(view: View, outline: Outline) {
+                outline.setRoundRect(0, 0, view.width, view.height, webOutlineRadius)
+            }
+        }
+        webView.clipToOutline = true
+
+        // O overlay diz onde o YouTube deve ficar e manda a pinça como toque.
+        overlay.onWebPanel = { visible, x, y, w, h, r -> updateWebPanel(visible, x, y, w, h, r) }
+        overlay.onWebTouch = { action, x, y -> sendWebTouch(action, x, y) }
+    }
+
+    private fun updateWebPanel(visible: Boolean, x: Float, y: Float, w: Float, h: Float, radius: Float) {
+        if (!visible) {
+            if (webShown) {
+                webShown = false
+                webView.post {
+                    // Pausa o vídeo ao fechar o menu.
+                    webView.evaluateJavascript(
+                        "document.querySelectorAll('video').forEach(function(v){v.pause();})", null
+                    )
+                    webView.visibility = View.GONE
+                }
+            }
             return
         }
-        val scale = min(width / iw, height / ih)
-        val offsetX = (width - iw * scale) / 2f
-        val offsetY = (height - ih * scale) / 2f
-        cb(
-            true,
-            offsetX + panelLeft * scale,
-            offsetY + panelTop * scale,
-            panelW * scale,
-            panelH * scale,
-            panelCorner * scale
-        )
-    }
-
-    /** Converte as posições (0 a 1) em pixels da imagem e calcula o tamanho de cada peça. */
-    private fun applyGeometry(iw: Float, ih: Float) {
-        val u = min(iw, ih)
-        iconS = u * 0.13f
-        gap = iconS * 0.25f
-        barW = ICON_COUNT * iconS + (ICON_COUNT + 1) * gap
-        barH = iconS + 2f * gap
-        barCX = barNX * iw
-        barCY = barNY * ih
-        barLeft = barCX - barW / 2f
-        barTop = barCY - barH / 2f
-
-        handleW = barW * 0.6f
-        handleCX = barCX
-        handleCY = barTop + barH + gap * 1.2f
-
-        for (i in 0 until ICON_COUNT) {
-            iconCX[i] = barLeft + gap + iconS / 2f + i * (iconS + gap)
-            iconCY[i] = barCY
-        }
-
-        // Menu aberto.
-        val margin = u * 0.03f
-        if (isWebPanel()) {
-            // Menu do YouTube: maior, para caber a página.
-            panelW = iw * 0.92f
-            panelH = ih * 0.36f
-        } else {
-            panelW = min(u * 0.62f, iw * 0.9f)
-            panelH = u * 0.30f
-        }
-        panelCorner = gap * 1.6f
-        pHandleW = panelW * 0.5f
-        val m = openMenu
-        if (m != NONE) {
-            val left: Float
-            val top: Float
-            if (panelMoved[m]) {
-                left = panelNX[m] * iw - panelW / 2f
-                top = panelNY[m] * ih - panelH / 2f
-            } else {
-                // Padrão: em cima da barra (ou embaixo dela, se não couber em cima).
-                left = barCX - panelW / 2f
-                val aboveTop = barTop - gap * 3.2f - panelH
-                top = if (aboveTop >= margin) aboveTop else handleCY + gap * 2.2f
+        if (webShown && x == webX && y == webY && w == webW && h == webH && radius == webR) return
+        webShown = true
+        webX = x; webY = y; webW = w; webH = h; webR = radius
+        webView.post {
+            val lp = webView.layoutParams
+            if (lp.width != w.toInt() || lp.height != h.toInt()) {
+                lp.width = w.toInt()
+                lp.height = h.toInt()
+                webView.layoutParams = lp
             }
-            val maxLeft = max(margin, iw - margin - panelW)
-            val maxTop = max(margin, ih - margin - panelH - gap * 2.5f)
-            panelLeft = left.coerceIn(margin, maxLeft)
-            panelTop = top.coerceIn(margin, maxTop)
-            pHandleCX = panelLeft + panelW / 2f
-            pHandleCY = panelTop + panelH + gap * 1.3f
-        }
-    }
-
-    /**
-     * Calcula onde está cada peça, se o dedo indicador encosta nelas
-     * e se a pinça está segurando algo.
-     */
-    private fun updateScene(iw: Float, ih: Float) {
-        sceneReady = iw > 1f && ih > 1f
-        if (!sceneReady) return
-
-        handleH = max(min(iw, ih) * 0.012f, 5f)
-        applyGeometry(iw, ih)
-
-        for (i in 0 until ICON_COUNT) iconTouch[i] = false
-        var handleTouch = false
-        var pHandleTouch = false
-        pinchCount = 0
-
-        val res = result
-        if (res != null) {
-            for (hand in res.landmarks()) {
-                if (hand.size <= MIDDLE_MCP) continue
-
-                // Dedo indicador encostando?
-                val fx = hand[INDEX_TIP].x() * iw
-                val fy = hand[INDEX_TIP].y() * ih
-                for (i in 0 until ICON_COUNT) {
-                    if (abs(fx - iconCX[i]) <= iconS * 0.55f && abs(fy - iconCY[i]) <= iconS * 0.55f) {
-                        iconTouch[i] = true
-                    }
-                }
-                if (abs(fx - handleCX) <= handleW / 2f && abs(fy - handleCY) <= iconS * 0.5f) {
-                    handleTouch = true
-                }
-                if (openMenu != NONE &&
-                    abs(fx - pHandleCX) <= pHandleW / 2f && abs(fy - pHandleCY) <= iconS * 0.5f
-                ) {
-                    pHandleTouch = true
-                }
-
-                // Pinça: distância polegar-indicador comparada com o tamanho da mão.
-                val tx = hand[THUMB_TIP].x() * iw
-                val ty = hand[THUMB_TIP].y() * ih
-                val handSize = hypot(
-                    (hand[WRIST].x() - hand[MIDDLE_MCP].x()) * iw,
-                    (hand[WRIST].y() - hand[MIDDLE_MCP].y()) * ih
-                )
-                if (handSize > 1f && pinchCount < MAX_HANDS) {
-                    val ratio = hypot(tx - fx, ty - fy) / handSize
-                    // Histerese: precisa fechar mais para pegar do que para soltar.
-                    val limit = if (grabbed != NONE) PINCH_RELEASE else PINCH_START
-                    if (ratio < limit) {
-                        pinchX[pinchCount] = (tx + fx) / 2f
-                        pinchY[pinchCount] = (ty + fy) / 2f
-                        pinchCount++
-                    }
-                }
+            webView.translationX = x
+            webView.translationY = y
+            if (radius != webOutlineRadius) {
+                webOutlineRadius = radius
+                webView.invalidateOutline()
             }
-        }
-
-        if (grabbed == NONE) {
-            // Tenta pegar: um ícone (toque), a barrinha da barra ou a barrinha do menu aberto.
-            var best = NONE
-            var bestDist = Float.MAX_VALUE
-            var bestIdx = -1
-            val reach = iconS * 0.65f
-            for (p in 0 until pinchCount) {
-                val px = pinchX[p]
-                val py = pinchY[p]
-                for (i in 0 until ICON_COUNT) {
-                    if (abs(px - iconCX[i]) <= reach && abs(py - iconCY[i]) <= reach) {
-                        val d = hypot(px - iconCX[i], py - iconCY[i])
-                        if (d < bestDist) { best = i; bestDist = d; bestIdx = p }
-                    }
-                }
-                // Soma iconS nas barrinhas para o ícone ganhar quando estiverem no mesmo ponto.
-                if (abs(px - handleCX) <= handleW / 2f + iconS * 0.3f && abs(py - handleCY) <= iconS * 0.5f) {
-                    val d = hypot(px - handleCX, py - handleCY) + iconS
-                    if (d < bestDist) { best = HANDLE; bestDist = d; bestIdx = p }
-                }
-                if (openMenu != NONE &&
-                    abs(px - pHandleCX) <= pHandleW / 2f + iconS * 0.3f && abs(py - pHandleCY) <= iconS * 0.5f
-                ) {
-                    val d = hypot(px - pHandleCX, py - pHandleCY) + iconS
-                    if (d < bestDist) { best = PANEL_HANDLE; bestDist = d; bestIdx = p }
-                }
-            }
-            if (best == NONE && isWebPanel()) {
-                // Pinça dentro do YouTube: funciona como o dedo na tela.
-                for (p in 0 until pinchCount) {
-                    if (pinchX[p] in panelLeft..(panelLeft + panelW) &&
-                        pinchY[p] in panelTop..(panelTop + panelH)
-                    ) {
-                        best = PANEL_CONTENT
-                        bestIdx = p
-                        break
-                    }
-                }
-            }
-            if (best != NONE) {
-                grabbed = best
-                grabStartTime = SystemClock.uptimeMillis()
-                grabStartX = pinchX[bestIdx]
-                grabStartY = pinchY[bestIdx]
-                tapCancelled = false
-                when (best) {
-                    HANDLE -> {
-                        grabOffsetX = barCX - pinchX[bestIdx]
-                        grabOffsetY = barCY - pinchY[bestIdx]
-                    }
-                    PANEL_HANDLE -> {
-                        grabOffsetX = panelLeft + panelW / 2f - pinchX[bestIdx]
-                        grabOffsetY = panelTop + panelH / 2f - pinchY[bestIdx]
-                    }
-                    PANEL_CONTENT -> {
-                        grabOffsetX = 0f
-                        grabOffsetY = 0f
-                        lastWebPX = pinchX[bestIdx]
-                        lastWebPY = pinchY[bestIdx]
-                        onWebTouch?.invoke(
-                            MotionEvent.ACTION_DOWN,
-                            (lastWebPX - panelLeft) * touchScale,
-                            (lastWebPY - panelTop) * touchScale
-                        )
-                    }
-                    else -> {
-                        grabOffsetX = 0f
-                        grabOffsetY = 0f
-                    }
-                }
-            }
-        } else {
-            if (pinchCount == 0) {
-                // Soltou. Pinça rápida num ícone, sem a mão se afastar = toque: abre/fecha o menu.
-                if (grabbed in 0 until ICON_COUNT && !tapCancelled &&
-                    SystemClock.uptimeMillis() - grabStartTime <= TAP_MAX_MS
-                ) {
-                    openMenu = if (openMenu == grabbed) NONE else grabbed
-                }
-                if (grabbed == PANEL_CONTENT) {
-                    onWebTouch?.invoke(
-                        MotionEvent.ACTION_UP,
-                        (lastWebPX - panelLeft) * touchScale,
-                        (lastWebPY - panelTop) * touchScale
-                    )
-                }
-                grabbed = NONE
-                applyGeometry(iw, ih)
-            } else {
-                // Onde a pinça deveria estar se ela estivesse acompanhando a peça segurada.
-                val expectedX: Float
-                val expectedY: Float
-                when (grabbed) {
-                    HANDLE -> {
-                        expectedX = barCX - grabOffsetX
-                        expectedY = barCY - grabOffsetY
-                    }
-                    PANEL_HANDLE -> {
-                        expectedX = panelLeft + panelW / 2f - grabOffsetX
-                        expectedY = panelTop + panelH / 2f - grabOffsetY
-                    }
-                    PANEL_CONTENT -> {
-                        expectedX = lastWebPX
-                        expectedY = lastWebPY
-                    }
-                    else -> {
-                        expectedX = grabStartX
-                        expectedY = grabStartY
-                    }
-                }
-                var idx = 0
-                var bestDist = Float.MAX_VALUE
-                for (p in 0 until pinchCount) {
-                    val d = hypot(pinchX[p] - expectedX, pinchY[p] - expectedY)
-                    if (d < bestDist) { bestDist = d; idx = p }
-                }
-
-                when (grabbed) {
-                    HANDLE -> {
-                        val nx = (pinchX[idx] + grabOffsetX) / iw
-                        val ny = (pinchY[idx] + grabOffsetY) / ih
-                        val halfW = min(barW / 2f / iw, 0.49f)
-                        barNX = nx.coerceIn(halfW, 1f - halfW)
-                        barNY = ny.coerceIn(0.10f, 0.82f)
-                    }
-                    PANEL_HANDLE -> {
-                        val m = openMenu
-                        if (m != NONE) {
-                            panelMoved[m] = true
-                            panelNX[m] = ((pinchX[idx] + grabOffsetX) / iw).coerceIn(0f, 1f)
-                            panelNY[m] = ((pinchY[idx] + grabOffsetY) / ih).coerceIn(0f, 1f)
-                        }
-                    }
-                    PANEL_CONTENT -> {
-                        lastWebPX = pinchX[idx].coerceIn(panelLeft, panelLeft + panelW)
-                        lastWebPY = pinchY[idx].coerceIn(panelTop, panelTop + panelH)
-                        onWebTouch?.invoke(
-                            MotionEvent.ACTION_MOVE,
-                            (lastWebPX - panelLeft) * touchScale,
-                            (lastWebPY - panelTop) * touchScale
-                        )
-                    }
-                    else -> {
-                        // Segurando um ícone: ele não se move; se a mão se afastar, cancela o toque.
-                        if (!tapCancelled &&
-                            hypot(pinchX[idx] - grabStartX, pinchY[idx] - grabStartY) > iconS * DRAG_START
-                        ) {
-                            tapCancelled = true
-                        }
-                    }
-                }
-                applyGeometry(iw, ih)
-            }
-        }
-
-        for (i in 0 until ICON_COUNT) {
-            iconState[i] = if (grabbed == i) 2 else if (iconTouch[i]) 1 else 0
-        }
-        handleState = if (grabbed == HANDLE) 2 else if (handleTouch) 1 else 0
-        pHandleState = if (grabbed == PANEL_HANDLE) 2 else if (pHandleTouch) 1 else 0
-    }
-
-    /** Desenha (imagem opcional +) menu + barra + esqueleto dentro de uma região da tela. */
-    private fun drawRegion(
-        canvas: Canvas,
-        left: Float,
-        regionWidth: Float,
-        regionHeight: Float,
-        bmp: Bitmap?,
-        iw: Float,
-        ih: Float
-    ) {
-        // Mesma regra de encaixe do PreviewView (FIT_CENTER), dentro da região.
-        val scale = min(regionWidth / iw, regionHeight / ih)
-        val offsetX = left + (regionWidth - iw * scale) / 2f
-        val offsetY = (regionHeight - ih * scale) / 2f
-
-        if (bmp != null) {
-            frameRect.set(offsetX, offsetY, offsetX + iw * scale, offsetY + ih * scale)
-            canvas.drawBitmap(bmp, null, frameRect, framePaint)
-        }
-
-        if (sceneReady) {
-            canvas.save()
-            canvas.translate(offsetX, offsetY)
-            canvas.scale(scale, scale)
-            drawPanel(canvas)
-            drawBar(canvas)
-            for (i in 0 until ICON_COUNT) drawIcon(canvas, i)
-            // Anel amarelo no ponto onde a pinça está fechada.
-            for (p in 0 until pinchCount) {
-                canvas.drawCircle(pinchX[p], pinchY[p], max(iconS * 0.25f, 8f), pinchPaint)
-            }
-            canvas.restore()
-        }
-
-        val res = result ?: return
-        for (hand in res.landmarks()) {
-            HandLandmarker.HAND_CONNECTIONS.forEach { connection ->
-                val a = hand[connection.start()]
-                val b = hand[connection.end()]
-                canvas.drawLine(
-                    a.x() * iw * scale + offsetX, a.y() * ih * scale + offsetY,
-                    b.x() * iw * scale + offsetX, b.y() * ih * scale + offsetY,
-                    linePaint
-                )
-            }
-            for (point in hand) {
-                canvas.drawCircle(
-                    point.x() * iw * scale + offsetX,
-                    point.y() * ih * scale + offsetY,
-                    9f,
-                    pointPaint
-                )
+            if (webView.visibility != View.VISIBLE) webView.visibility = View.VISIBLE
+            if (!webLoaded) {
+                webLoaded = true
+                webView.loadUrl("https://m.youtube.com")
             }
         }
     }
 
-    /** Barrinha branca (alça) usada para mover a barra ou um menu. */
-    private fun drawHandle(canvas: Canvas, cx: Float, cy: Float, w: Float, state: Int) {
-        val h = if (state == 0) handleH else handleH * 1.8f
-        fillPaint.color = if (state == 2) Color.YELLOW else Color.WHITE
-        rect.set(cx - w / 2f, cy - h / 2f, cx + w / 2f, cy + h / 2f)
-        canvas.drawRoundRect(rect, h / 2f, h / 2f, fillPaint)
+    /** Transforma a pinça em um toque de dedo no YouTube. */
+    private fun sendWebTouch(action: Int, x: Float, y: Float) {
+        val now = SystemClock.uptimeMillis()
+        if (action == MotionEvent.ACTION_DOWN) webDownTime = now
+        val event = MotionEvent.obtain(webDownTime, now, action, x, y, 0)
+        webView.dispatchTouchEvent(event)
+        event.recycle()
     }
 
-    private fun drawBar(canvas: Canvas) {
-        // Fundo da barra (escuro e meio transparente).
-        fillPaint.color = Color.argb(130, 30, 30, 30)
-        rect.set(barLeft, barTop, barLeft + barW, barTop + barH)
-        val r = gap * 1.6f
-        canvas.drawRoundRect(rect, r, r, fillPaint)
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (webShown && webView.canGoBack()) webView.goBack() else super.onBackPressed()
+    }
 
-        // Barrinha branca embaixo: serve para mover a barra.
-        drawHandle(canvas, handleCX, handleCY, handleW, handleState)
+    override fun onPause() {
+        super.onPause()
+        webView.onPause()
+    }
 
-        // Bolinha branca embaixo do ícone que está com o menu aberto.
-        if (openMenu != NONE) {
-            fillPaint.color = Color.WHITE
-            canvas.drawCircle(iconCX[openMenu], barTop + barH - gap * 0.5f, gap * 0.28f, fillPaint)
+    override fun onResume() {
+        super.onResume()
+        webView.onResume()
+    }
+
+    private fun orientationForMode(): Int =
+        if (vrMode) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        else ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+
+    private fun applyModeUi() {
+        // No VR Box a imagem da câmera é desenhada pelo overlay (uma vez para cada olho),
+        // então o PreviewView normal fica escondido.
+        previewView.visibility = if (vrMode) View.GONE else View.VISIBLE
+        overlay.vrMode = vrMode
+        // No VR Box a câmera é sempre a traseira, então o botão de virar câmera some.
+        flipButton.visibility = if (vrMode) View.GONE else View.VISIBLE
+        modeButton.text = if (vrMode) "Modo normal" else "Modo VR Box"
+        overlay.clear()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun currentRotation(): Int = windowManager.defaultDisplay?.rotation ?: Surface.ROTATION_0
+
+    private fun buildLandmarker(delegate: Delegate): HandLandmarker {
+        val options = HandLandmarker.HandLandmarkerOptions.builder()
+            .setBaseOptions(
+                BaseOptions.builder()
+                    .setModelAssetPath("hand_landmarker.task")
+                    .setDelegate(delegate)
+                    .build()
+            )
+            .setRunningMode(RunningMode.LIVE_STREAM)
+            .setNumHands(2)
+            .setMinHandDetectionConfidence(0.5f)
+            .setMinHandPresenceConfidence(0.5f)
+            .setMinTrackingConfidence(0.5f)
+            .setResultListener { result: HandLandmarkerResult, input ->
+                overlay.setResults(result, input.width, input.height)
+            }
+            .setErrorListener { error ->
+                runOnUiThread { Toast.makeText(this, error.message, Toast.LENGTH_SHORT).show() }
+            }
+            .build()
+        return HandLandmarker.createFromOptions(this, options)
+    }
+
+    private fun setupHandLandmarker() {
+        // Tenta usar a GPU (bem mais rápido). Se o celular não suportar, cai para a CPU.
+        handLandmarker = try {
+            buildLandmarker(Delegate.GPU)
+        } catch (e: Exception) {
+            try {
+                buildLandmarker(Delegate.CPU)
+            } catch (e2: Exception) {
+                Toast.makeText(this, R.string.model_error, Toast.LENGTH_LONG).show()
+                null
+            }
         }
     }
 
-    /** Menu vazio do ícone que foi tocado (por enquanto só a janela, sem nada dentro). */
-    private fun drawPanel(canvas: Canvas) {
-        val m = openMenu
-        if (m == NONE) return
-        rect.set(panelLeft, panelTop, panelLeft + panelW, panelTop + panelH)
-        val r = gap * 1.6f
-        if (!isWebPanel()) {
-            fillPaint.color = Color.argb(150, 20, 20, 20)
-            canvas.drawRoundRect(rect, r, r, fillPaint)
-        }
-        // Borda com a cor do ícone que abriu o menu.
-        panelBorderPaint.color = iconColors[m]
-        canvas.drawRoundRect(rect, r, r, panelBorderPaint)
+    private fun startCamera() {
+        val providerFuture = ProcessCameraProvider.getInstance(this)
+        providerFuture.addListener({
+            // A tela pode ter sido recriada (giro de orientação) enquanto a câmera preparava.
+            if (isDestroyed || isFinishing) return@addListener
 
-        // Barrinha branca embaixo do menu: serve para mover só este menu.
-        drawHandle(canvas, pHandleCX, pHandleCY, pHandleW, pHandleState)
+            val provider = providerFuture.get()
+
+            val analysisCase = ImageAnalysis.Builder()
+                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                .setTargetRotation(currentRotation())
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                .build()
+                .also { it.setAnalyzer(cameraExecutor) { image -> detect(image) } }
+            analysis = analysisCase
+
+            val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
+            try {
+                provider.unbindAll()
+                if (vrMode) {
+                    // VR Box: só a análise; a imagem é desenhada pelo overlay nos dois olhos.
+                    provider.bindToLifecycle(this, selector, analysisCase)
+                } else {
+                    val preview = Preview.Builder()
+                        .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                        .build()
+                        .also { it.setSurfaceProvider(previewView.surfaceProvider) }
+                    provider.bindToLifecycle(this, selector, preview, analysisCase)
+                }
+            } catch (e: Exception) {
+                Toast.makeText(this, e.message, Toast.LENGTH_LONG).show()
+            }
+        }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun drawIcon(canvas: Canvas, i: Int) {
-        val state = iconState[i]
-        val grow = when (state) {
-            2 -> 1.2f
-            1 -> 1.1f
-            else -> 1f
+    private fun detect(imageProxy: ImageProxy) {
+        val landmarker = handLandmarker
+        if (landmarker == null) {
+            imageProxy.close()
+            return
         }
-        val half = iconS / 2f * grow
-        val cx = iconCX[i]
-        val cy = iconCY[i]
-        val radius = half * 0.5f
 
-        rect.set(cx - half, cy - half, cx + half, cy + half)
-        fillPaint.color = iconColors[i]
-        canvas.drawRoundRect(rect, radius, radius, fillPaint)
-        canvas.drawRoundRect(rect, radius, radius, outlinePaint)
+        val w = imageProxy.width
+        val h = imageProxy.height
+        val rotation = imageProxy.imageInfo.rotationDegrees
 
-        if (state == 1) {
-            // Acende quando o dedo encosta.
-            fillPaint.color = Color.argb(70, 255, 255, 255)
-            canvas.drawRoundRect(rect, radius, radius, fillPaint)
-        } else if (state == 2) {
-            canvas.drawRoundRect(rect, radius, radius, pressRingPaint)
+        // Reaproveita o bitmap do frame se o tamanho não mudou.
+        var frame = frameBitmap
+        if (frame == null || frame.width != w || frame.height != h) {
+            frame = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            frameBitmap = frame
         }
+        imageProxy.use { frame.copyPixelsFromBuffer(it.planes[0].buffer) }
+
+        // Tamanho final depois da rotação.
+        val outW = if (rotation % 180 == 0) w else h
+        val outH = if (rotation % 180 == 0) h else w
+
+        frameBufferIndex = 1 - frameBufferIndex
+        var prepared = frameBuffers[frameBufferIndex]
+        if (prepared == null || prepared.width != outW || prepared.height != outH) {
+            prepared = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
+            frameBuffers[frameBufferIndex] = prepared
+        }
+
+        // Rotação + espelho (câmera frontal) em uma única operação, sem criar bitmap novo.
+        transform.reset()
+        transform.postTranslate(-w / 2f, -h / 2f)
+        transform.postRotate(rotation.toFloat())
+        if (lensFacing == CameraSelector.LENS_FACING_FRONT) {
+            transform.postScale(-1f, 1f)
+        }
+        transform.postTranslate(outW / 2f, outH / 2f)
+        Canvas(prepared).drawBitmap(frame, transform, null)
+
+        // No VR Box, manda o frame para a tela desenhar nos dois olhos.
+        if (vrMode) overlay.setFrame(prepared)
+
+        landmarker.detectAsync(BitmapImageBuilder(prepared).build(), SystemClock.uptimeMillis())
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        webView.stopLoading()
+        webView.destroy()
+        (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
+            .unregisterDisplayListener(displayListener)
+        cameraExecutor.shutdown()
+        handLandmarker?.close()
     }
 
     private companion object {
-        // Pontos da mão no modelo do MediaPipe.
-        const val WRIST = 0
-        const val THUMB_TIP = 4
-        const val INDEX_TIP = 8
-        const val MIDDLE_MCP = 9
-
-        // Sensibilidade da pinça (distância polegar-indicador / tamanho da mão).
-        // Quanto MAIOR o número, mais "fácil" é pegar/soltar.
-        const val PINCH_START = 0.30f
-        const val PINCH_RELEASE = 0.45f
-
-        const val TAP_MAX_MS = 900L     // pinça mais curta que isso (sem a mão se afastar) = toque
-        const val DRAG_START = 0.4f     // quanto a mão pode se afastar (em tamanhos de ícone) e ainda ser toque
-
-        const val ICON_COUNT = 3
-        const val YOUTUBE_ICON = 1   // o ícone vermelho abre o YouTube
-        const val MAX_HANDS = 4
-        const val NONE = -1
-        const val HANDLE = ICON_COUNT          // barrinha que move a barra
-        const val PANEL_HANDLE = ICON_COUNT + 1  // barrinha que move o menu aberto
-        const val PANEL_CONTENT = ICON_COUNT + 2 // pinça dentro do YouTube (clicar/rolar)
+        const val KEY_VR_MODE = "vr_mode"
+        const val KEY_LENS = "lens_facing"
     }
 }
