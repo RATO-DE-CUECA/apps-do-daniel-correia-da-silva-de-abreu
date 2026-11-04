@@ -9,6 +9,13 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
+    <!-- YouTube (aparece dentro do menu vermelho, só no modo normal). Fica entre a câmera e o overlay. -->
+    <WebView
+        android:id="@+id/youtubeView"
+        android:layout_width="100dp"
+        android:layout_height="100dp"
+        android:visibility="gone" />
+
     <com.handtracking.app.HandOverlayView
         android:id="@+id/overlay"
         android:layout_width="match_parent"
