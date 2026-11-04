@@ -9,6 +9,10 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Outline
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.hardware.display.DisplayManager
 import android.os.SystemClock
 import android.os.Bundle
@@ -48,6 +52,27 @@ class MainActivity : AppCompatActivity() {
     private lateinit var modeButton: Button
     private lateinit var flipButton: Button
     private lateinit var webView: WebView
+    private lateinit var centerButton: Button
+
+    // Giroscópio (modo 3D): a barra e os menus ficam parados no espaço.
+    private var sensorManager: SensorManager? = null
+    private var rotationSensor: Sensor? = null
+    private var hasRotationSensor = false
+    private val rotationMatrix = FloatArray(9)
+    private val rotationValues = FloatArray(4)
+    private val sensorListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            var values = event.values
+            if (values.size > 4) {
+                System.arraycopy(values, 0, rotationValues, 0, 4)
+                values = rotationValues
+            }
+            SensorManager.getRotationMatrixFromVector(rotationMatrix, values)
+            overlay.setGyro(rotationMatrix.clone())
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
 
     // YouTube dentro do menu vermelho (só no modo normal).
     private var webShown = false
@@ -91,6 +116,7 @@ class MainActivity : AppCompatActivity() {
         override fun onDisplayRemoved(displayId: Int) {}
         override fun onDisplayChanged(displayId: Int) {
             analysis?.targetRotation = currentRotation()
+            overlay.setDisplayRotation(currentRotation())
         }
     }
 
@@ -111,6 +137,7 @@ class MainActivity : AppCompatActivity() {
         overlay = findViewById(R.id.overlay)
         modeButton = findViewById(R.id.modeButton)
         setupWebView()
+        setupSensors()
         cameraExecutor = Executors.newSingleThreadExecutor()
 
         flipButton = findViewById(R.id.flipButton)
@@ -148,6 +175,24 @@ class MainActivity : AppCompatActivity() {
         super.onSaveInstanceState(outState)
         outState.putBoolean(KEY_VR_MODE, vrMode)
         outState.putInt(KEY_LENS, lensFacing)
+    }
+
+    private fun setupSensors() {
+        val sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        sensorManager = sm
+        // Sem ímã (bússola): mais estável dentro de casa.
+        // 1º giroscópio (melhor), 2º giroscópio/bússola do Android, 3º só acelerômetro + bússola.
+        rotationSensor = sm.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
+            ?: sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+            ?: sm.getDefaultSensor(Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR)
+        hasRotationSensor = rotationSensor != null
+        // Aviso rápido para saber qual sensor o seu celular está usando.
+        Toast.makeText(this, "Sensor 3D: " + (rotationSensor?.name ?: "nenhum"), Toast.LENGTH_LONG).show()
+        overlay.setDisplayRotation(currentRotation())
+
+        centerButton = findViewById(R.id.centerButton)
+        centerButton.visibility = if (hasRotationSensor) View.VISIBLE else View.GONE
+        centerButton.setOnClickListener { overlay.recenter() }
     }
 
     private fun setupWebView() {
@@ -226,11 +271,16 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         webView.onPause()
+        sensorManager?.unregisterListener(sensorListener)
     }
 
     override fun onResume() {
         super.onResume()
         webView.onResume()
+        val sensor = rotationSensor
+        if (sensor != null) {
+            sensorManager?.registerListener(sensorListener, sensor, SensorManager.SENSOR_DELAY_GAME)
+        }
     }
 
     private fun orientationForMode(): Int =
@@ -289,6 +339,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startCamera() {
+        // Modo 3D (menu parado no espaço) só funciona com a câmera traseira.
+        overlay.worldMode = hasRotationSensor && lensFacing == CameraSelector.LENS_FACING_BACK
+
         val providerFuture = ProcessCameraProvider.getInstance(this)
         providerFuture.addListener({
             // A tela pode ter sido recriada (giro de orientação) enquanto a câmera preparava.
@@ -365,7 +418,7 @@ class MainActivity : AppCompatActivity() {
         Canvas(prepared).drawBitmap(frame, transform, null)
 
         // No VR Box, manda o frame para a tela desenhar nos dois olhos.
-        if (vrMode) overlay.setFrame(prepared)
+        if (vrMode) overlay.setFrame(prepared, overlay.currentRotation())
 
         landmarker.detectAsync(BitmapImageBuilder(prepared).build(), SystemClock.uptimeMillis())
     }
