@@ -98,6 +98,10 @@ class MainActivity : AppCompatActivity() {
     private var webR = 0f
     private var webOutlineRadius = 0f
     private var webDownTime = 0L
+
+    // YouTube no modo VR Box (tela virtual copiada para os dois olhos).
+    private var webTexture: WebTexture? = null
+    private var vrWebWanted = false
     private lateinit var cameraExecutor: ExecutorService
 
     private var handLandmarker: HandLandmarker? = null
@@ -242,6 +246,8 @@ class MainActivity : AppCompatActivity() {
         // O overlay diz onde o YouTube deve ficar e manda a pinça como toque.
         overlay.onWebPanel = { visible, x, y, w, h, r -> updateWebPanel(visible, x, y, w, h, r) }
         overlay.onWebTouch = { action, x, y -> sendWebTouch(action, x, y) }
+        overlay.onVrWebWanted = { wanted -> updateVrWeb(wanted) }
+        overlay.onVrWebTouch = { action, x, y -> webTexture?.touch(action, x, y) }
     }
 
     private fun updateWebPanel(visible: Boolean, x: Float, y: Float, w: Float, h: Float, radius: Float) {
@@ -282,6 +288,23 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** Liga ou desliga o YouTube do modo VR Box (a tela virtual que vai para os dois olhos). */
+    private fun updateVrWeb(wanted: Boolean) {
+        if (wanted == vrWebWanted) return
+        vrWebWanted = wanted
+        if (wanted) {
+            val wt = webTexture ?: WebTexture(this).also { webTexture = it }
+            wt.onFrame = { overlay.setWebFrame(wt.latest) }
+            if (!wt.start()) {
+                Toast.makeText(this, "YouTube no VR Box não funcionou neste celular", Toast.LENGTH_LONG).show()
+            } else {
+                wt.setActive(true)
+            }
+        } else {
+            webTexture?.setActive(false)
+        }
+    }
+
     /** Transforma a pinça em um toque de dedo no YouTube. */
     private fun sendWebTouch(action: Int, x: Float, y: Float) {
         val now = SystemClock.uptimeMillis()
@@ -299,6 +322,7 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         webView.onPause()
+        webTexture?.setActive(false)
         sensorManager?.unregisterListener(sensorListener)
         sensorManager?.unregisterListener(accelListener)
     }
@@ -306,6 +330,7 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         webView.onResume()
+        webTexture?.setActive(vrWebWanted)
         val sensor = rotationSensor
         if (sensor != null) {
             sensorManager?.registerListener(sensorListener, sensor, SensorManager.SENSOR_DELAY_GAME)
@@ -473,6 +498,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        webTexture?.stop()
         webView.stopLoading()
         webView.destroy()
         (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
