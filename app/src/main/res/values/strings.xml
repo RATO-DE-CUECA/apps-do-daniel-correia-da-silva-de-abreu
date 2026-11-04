@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Hand Tracking</string>
+    <string name="app_name">AETHER MR</string>
     <string name="flip_camera">Virar câmera</string>
     <string name="permission_denied">Preciso da permissão da câmera para rastrear as mãos.</string>
     <string name="model_error">Não consegui carregar o modelo de rastreamento.</string>
