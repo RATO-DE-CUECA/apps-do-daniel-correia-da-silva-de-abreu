@@ -29,6 +29,16 @@
         android:layout_marginBottom="32dp"
         android:text="@string/flip_camera" />
 
+    <!-- Botão do cantinho de cima à esquerda: traz a barra de volta para a frente de você. -->
+    <Button
+        android:id="@+id/centerButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:layout_margin="12dp"
+        android:text="Centralizar"
+        android:textSize="12sp" />
+
     <!-- Botão do cantinho: alterna entre modo VR Box (tela dividida) e modo normal. -->
     <Button
         android:id="@+id/modeButton"
