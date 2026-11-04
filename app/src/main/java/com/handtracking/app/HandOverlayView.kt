@@ -6,6 +6,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
+import android.os.SystemClock
 import android.util.AttributeSet
 import android.view.View
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
@@ -18,9 +19,10 @@ import kotlin.math.min
 /**
  * Desenha o esqueleto da mão e uma barra flutuante com 3 ícones (verde, vermelho e azul).
  *  - Encostar o dedo indicador num ícone: ele cresce um pouco e acende.
- *  - Pinça (polegar + indicador) num ícone: puxa o ícone para fora da barra e arrasta.
- *  - Soltar o ícone em cima da barra: ele volta para o seu lugar.
+ *  - Pinça rápida (fechar e abrir os dedos) num ícone: abre (ou fecha) o menu daquele ícone.
+ *  - Os ícones ficam sempre no lugar (não dá para arrastar).
  *  - Pinça na barrinha branca embaixo da barra: move a barra inteira.
+ *  - Pinça na barrinha branca embaixo de um menu: move só aquele menu.
  * No modo VR Box também desenha a imagem da câmera e repete tudo para os dois olhos.
  */
 class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs) {
@@ -56,7 +58,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     }
     private val frameRect = RectF()
 
-    // ---- Barra de ícones ----
+    // ---- Barra de ícones e menus ----
     private val fillPaint = Paint().apply {
         isAntiAlias = true
         style = Paint.Style.FILL
@@ -67,11 +69,16 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         strokeWidth = 3f
         color = Color.argb(140, 0, 0, 0)
     }
-    private val grabRingPaint = Paint().apply {
+    private val pressRingPaint = Paint().apply {
         isAntiAlias = true
         style = Paint.Style.STROKE
         strokeWidth = 5f
         color = Color.WHITE
+    }
+    private val panelBorderPaint = Paint().apply {
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        strokeWidth = 6f
     }
     private val pinchPaint = Paint().apply {
         isAntiAlias = true
@@ -88,13 +95,18 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     )
 
     // Posição do CENTRO da barra, de 0 a 1 (fração da imagem da câmera).
+    // Altura: 0 = topo da imagem, 1 = embaixo. (0.55 = meio da tela)
     private var barNX = 0.5f
-    private var barNY = 0.75f
+    private var barNY = 0.55f
 
-    // Ícones: dentro da barra (no seu lugar) ou soltos (posição própria, de 0 a 1).
-    private val iconInBar = BooleanArray(ICON_COUNT) { true }
-    private val iconNX = FloatArray(ICON_COUNT)
-    private val iconNY = FloatArray(ICON_COUNT)
+    // Menu aberto (índice do ícone) ou NONE. Só um menu fica aberto por vez.
+    private var openMenu = NONE
+
+    // Cada menu lembra a própria posição depois que você o move (centro, de 0 a 1).
+    // Enquanto não foi movido, ele aparece em cima da barra e acompanha a barra.
+    private val panelMoved = BooleanArray(ICON_COUNT)
+    private val panelNX = FloatArray(ICON_COUNT)
+    private val panelNY = FloatArray(ICON_COUNT)
 
     // Geometria em pixels da imagem da câmera (recalculada a cada desenho).
     private var sceneReady = false
@@ -113,15 +125,28 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     private val iconCX = FloatArray(ICON_COUNT)
     private val iconCY = FloatArray(ICON_COUNT)
 
-    // Estado de cada ícone: 0 = normal, 1 = dedo encostando, 2 = segurado.
+    private var panelW = 0f
+    private var panelH = 0f
+    private var panelLeft = 0f
+    private var panelTop = 0f
+    private var pHandleCX = 0f
+    private var pHandleCY = 0f
+    private var pHandleW = 0f
+
+    // Estado: 0 = normal, 1 = dedo encostando, 2 = segurado.
     private val iconState = IntArray(ICON_COUNT)
     private val iconTouch = BooleanArray(ICON_COUNT)
     private var handleState = 0
+    private var pHandleState = 0
 
-    // Pegar e mover.
+    // Pinça (pegar).
     private var grabbed = NONE
     private var grabOffsetX = 0f
     private var grabOffsetY = 0f
+    private var tapCancelled = false   // true = a mão se afastou, então não conta como toque
+    private var grabStartTime = 0L
+    private var grabStartX = 0f
+    private var grabStartY = 0f
     private val pinchX = FloatArray(MAX_HANDS)
     private val pinchY = FloatArray(MAX_HANDS)
     private var pinchCount = 0
@@ -177,33 +202,55 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         barTop = barCY - barH / 2f
 
         handleW = barW * 0.6f
-        handleH = max(u * 0.012f, 5f)
         handleCX = barCX
         handleCY = barTop + barH + gap * 1.2f
 
         for (i in 0 until ICON_COUNT) {
-            if (iconInBar[i]) {
-                iconCX[i] = barLeft + gap + iconS / 2f + i * (iconS + gap)
-                iconCY[i] = barCY
+            iconCX[i] = barLeft + gap + iconS / 2f + i * (iconS + gap)
+            iconCY[i] = barCY
+        }
+
+        // Menu aberto.
+        val margin = u * 0.03f
+        panelW = min(u * 0.62f, iw * 0.9f)
+        panelH = u * 0.30f
+        pHandleW = panelW * 0.5f
+        val m = openMenu
+        if (m != NONE) {
+            val left: Float
+            val top: Float
+            if (panelMoved[m]) {
+                left = panelNX[m] * iw - panelW / 2f
+                top = panelNY[m] * ih - panelH / 2f
             } else {
-                iconCX[i] = iconNX[i] * iw
-                iconCY[i] = iconNY[i] * ih
+                // Padrão: em cima da barra (ou embaixo dela, se não couber em cima).
+                left = barCX - panelW / 2f
+                val aboveTop = barTop - gap * 3.2f - panelH
+                top = if (aboveTop >= margin) aboveTop else handleCY + gap * 2.2f
             }
+            val maxLeft = max(margin, iw - margin - panelW)
+            val maxTop = max(margin, ih - margin - panelH - gap * 2.5f)
+            panelLeft = left.coerceIn(margin, maxLeft)
+            panelTop = top.coerceIn(margin, maxTop)
+            pHandleCX = panelLeft + panelW / 2f
+            pHandleCY = panelTop + panelH + gap * 1.3f
         }
     }
 
     /**
      * Calcula onde está cada peça, se o dedo indicador encosta nelas
-     * e se a pinça está segurando algo (e então move).
+     * e se a pinça está segurando algo.
      */
     private fun updateScene(iw: Float, ih: Float) {
         sceneReady = iw > 1f && ih > 1f
         if (!sceneReady) return
 
+        handleH = max(min(iw, ih) * 0.012f, 5f)
         applyGeometry(iw, ih)
 
         for (i in 0 until ICON_COUNT) iconTouch[i] = false
         var handleTouch = false
+        var pHandleTouch = false
         pinchCount = 0
 
         val res = result
@@ -221,6 +268,11 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 }
                 if (abs(fx - handleCX) <= handleW / 2f && abs(fy - handleCY) <= iconS * 0.5f) {
                     handleTouch = true
+                }
+                if (openMenu != NONE &&
+                    abs(fx - pHandleCX) <= pHandleW / 2f && abs(fy - pHandleCY) <= iconS * 0.5f
+                ) {
+                    pHandleTouch = true
                 }
 
                 // Pinça: distância polegar-indicador comparada com o tamanho da mão.
@@ -244,7 +296,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         }
 
         if (grabbed == NONE) {
-            // Tenta pegar: primeiro um ícone, senão a barrinha de mover a barra.
+            // Tenta pegar: um ícone (toque), a barrinha da barra ou a barrinha do menu aberto.
             var best = NONE
             var bestDist = Float.MAX_VALUE
             var bestIdx = -1
@@ -258,61 +310,98 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                         if (d < bestDist) { best = i; bestDist = d; bestIdx = p }
                     }
                 }
+                // Soma iconS nas barrinhas para o ícone ganhar quando estiverem no mesmo ponto.
                 if (abs(px - handleCX) <= handleW / 2f + iconS * 0.3f && abs(py - handleCY) <= iconS * 0.5f) {
-                    // Soma iconS para o ícone ganhar quando os dois estiverem no mesmo ponto.
                     val d = hypot(px - handleCX, py - handleCY) + iconS
                     if (d < bestDist) { best = HANDLE; bestDist = d; bestIdx = p }
+                }
+                if (openMenu != NONE &&
+                    abs(px - pHandleCX) <= pHandleW / 2f + iconS * 0.3f && abs(py - pHandleCY) <= iconS * 0.5f
+                ) {
+                    val d = hypot(px - pHandleCX, py - pHandleCY) + iconS
+                    if (d < bestDist) { best = PANEL_HANDLE; bestDist = d; bestIdx = p }
                 }
             }
             if (best != NONE) {
                 grabbed = best
-                if (best == HANDLE) {
-                    grabOffsetX = barCX - pinchX[bestIdx]
-                    grabOffsetY = barCY - pinchY[bestIdx]
-                } else {
-                    grabOffsetX = iconCX[best] - pinchX[bestIdx]
-                    grabOffsetY = iconCY[best] - pinchY[bestIdx]
-                    if (iconInBar[best]) {
-                        // Puxou o ícone para fora da barra.
-                        iconInBar[best] = false
-                        iconNX[best] = iconCX[best] / iw
-                        iconNY[best] = iconCY[best] / ih
+                grabStartTime = SystemClock.uptimeMillis()
+                grabStartX = pinchX[bestIdx]
+                grabStartY = pinchY[bestIdx]
+                tapCancelled = false
+                when (best) {
+                    HANDLE -> {
+                        grabOffsetX = barCX - pinchX[bestIdx]
+                        grabOffsetY = barCY - pinchY[bestIdx]
+                    }
+                    PANEL_HANDLE -> {
+                        grabOffsetX = panelLeft + panelW / 2f - pinchX[bestIdx]
+                        grabOffsetY = panelTop + panelH / 2f - pinchY[bestIdx]
+                    }
+                    else -> {
+                        grabOffsetX = 0f
+                        grabOffsetY = 0f
                     }
                 }
             }
         } else {
             if (pinchCount == 0) {
-                // Soltou. Se um ícone foi solto em cima da barra, ele volta para o seu lugar.
-                if (grabbed != HANDLE) {
-                    val i = grabbed
-                    val margin = iconS * 0.3f
-                    if (iconCX[i] in (barLeft - margin)..(barLeft + barW + margin) &&
-                        iconCY[i] in (barTop - margin)..(barTop + barH + margin)
-                    ) {
-                        iconInBar[i] = true
-                    }
+                // Soltou. Pinça rápida num ícone, sem a mão se afastar = toque: abre/fecha o menu.
+                if (grabbed in 0 until ICON_COUNT && !tapCancelled &&
+                    SystemClock.uptimeMillis() - grabStartTime <= TAP_MAX_MS
+                ) {
+                    openMenu = if (openMenu == grabbed) NONE else grabbed
                 }
                 grabbed = NONE
                 applyGeometry(iw, ih)
             } else {
-                // Segue a pinça mais perto da peça segurada.
-                val cx = if (grabbed == HANDLE) barCX else iconCX[grabbed]
-                val cy = if (grabbed == HANDLE) barCY else iconCY[grabbed]
+                // Onde a pinça deveria estar se ela estivesse acompanhando a peça segurada.
+                val expectedX: Float
+                val expectedY: Float
+                when (grabbed) {
+                    HANDLE -> {
+                        expectedX = barCX - grabOffsetX
+                        expectedY = barCY - grabOffsetY
+                    }
+                    PANEL_HANDLE -> {
+                        expectedX = panelLeft + panelW / 2f - grabOffsetX
+                        expectedY = panelTop + panelH / 2f - grabOffsetY
+                    }
+                    else -> {
+                        expectedX = grabStartX
+                        expectedY = grabStartY
+                    }
+                }
                 var idx = 0
                 var bestDist = Float.MAX_VALUE
                 for (p in 0 until pinchCount) {
-                    val d = hypot(pinchX[p] - cx, pinchY[p] - cy)
+                    val d = hypot(pinchX[p] - expectedX, pinchY[p] - expectedY)
                     if (d < bestDist) { bestDist = d; idx = p }
                 }
-                val nx = (pinchX[idx] + grabOffsetX) / iw
-                val ny = (pinchY[idx] + grabOffsetY) / ih
-                if (grabbed == HANDLE) {
-                    val halfW = min(barW / 2f / iw, 0.49f)
-                    barNX = nx.coerceIn(halfW, 1f - halfW)
-                    barNY = ny.coerceIn(0.10f, 0.82f)
-                } else {
-                    iconNX[grabbed] = nx.coerceIn(0.05f, 0.95f)
-                    iconNY[grabbed] = ny.coerceIn(0.05f, 0.95f)
+
+                when (grabbed) {
+                    HANDLE -> {
+                        val nx = (pinchX[idx] + grabOffsetX) / iw
+                        val ny = (pinchY[idx] + grabOffsetY) / ih
+                        val halfW = min(barW / 2f / iw, 0.49f)
+                        barNX = nx.coerceIn(halfW, 1f - halfW)
+                        barNY = ny.coerceIn(0.10f, 0.82f)
+                    }
+                    PANEL_HANDLE -> {
+                        val m = openMenu
+                        if (m != NONE) {
+                            panelMoved[m] = true
+                            panelNX[m] = ((pinchX[idx] + grabOffsetX) / iw).coerceIn(0f, 1f)
+                            panelNY[m] = ((pinchY[idx] + grabOffsetY) / ih).coerceIn(0f, 1f)
+                        }
+                    }
+                    else -> {
+                        // Segurando um ícone: ele não se move; se a mão se afastar, cancela o toque.
+                        if (!tapCancelled &&
+                            hypot(pinchX[idx] - grabStartX, pinchY[idx] - grabStartY) > iconS * DRAG_START
+                        ) {
+                            tapCancelled = true
+                        }
+                    }
                 }
                 applyGeometry(iw, ih)
             }
@@ -322,9 +411,10 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             iconState[i] = if (grabbed == i) 2 else if (iconTouch[i]) 1 else 0
         }
         handleState = if (grabbed == HANDLE) 2 else if (handleTouch) 1 else 0
+        pHandleState = if (grabbed == PANEL_HANDLE) 2 else if (pHandleTouch) 1 else 0
     }
 
-    /** Desenha (imagem opcional +) barra + esqueleto dentro de uma região da tela. */
+    /** Desenha (imagem opcional +) menu + barra + esqueleto dentro de uma região da tela. */
     private fun drawRegion(
         canvas: Canvas,
         left: Float,
@@ -348,11 +438,9 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             canvas.save()
             canvas.translate(offsetX, offsetY)
             canvas.scale(scale, scale)
+            drawPanel(canvas)
             drawBar(canvas)
-            // Ícones na barra, depois os soltos, e o segurado por último (fica por cima).
-            for (i in 0 until ICON_COUNT) if (iconInBar[i] && grabbed != i) drawIcon(canvas, i)
-            for (i in 0 until ICON_COUNT) if (!iconInBar[i] && grabbed != i) drawIcon(canvas, i)
-            if (grabbed in 0 until ICON_COUNT) drawIcon(canvas, grabbed)
+            for (i in 0 until ICON_COUNT) drawIcon(canvas, i)
             // Anel amarelo no ponto onde a pinça está fechada.
             for (p in 0 until pinchCount) {
                 canvas.drawCircle(pinchX[p], pinchY[p], max(iconS * 0.25f, 8f), pinchPaint)
@@ -382,6 +470,14 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         }
     }
 
+    /** Barrinha branca (alça) usada para mover a barra ou um menu. */
+    private fun drawHandle(canvas: Canvas, cx: Float, cy: Float, w: Float, state: Int) {
+        val h = if (state == 0) handleH else handleH * 1.8f
+        fillPaint.color = if (state == 2) Color.YELLOW else Color.WHITE
+        rect.set(cx - w / 2f, cy - h / 2f, cx + w / 2f, cy + h / 2f)
+        canvas.drawRoundRect(rect, h / 2f, h / 2f, fillPaint)
+    }
+
     private fun drawBar(canvas: Canvas) {
         // Fundo da barra (escuro e meio transparente).
         fillPaint.color = Color.argb(130, 30, 30, 30)
@@ -390,10 +486,29 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         canvas.drawRoundRect(rect, r, r, fillPaint)
 
         // Barrinha branca embaixo: serve para mover a barra.
-        val h = if (handleState == 0) handleH else handleH * 1.8f
-        fillPaint.color = if (handleState == 2) Color.YELLOW else Color.WHITE
-        rect.set(handleCX - handleW / 2f, handleCY - h / 2f, handleCX + handleW / 2f, handleCY + h / 2f)
-        canvas.drawRoundRect(rect, h / 2f, h / 2f, fillPaint)
+        drawHandle(canvas, handleCX, handleCY, handleW, handleState)
+
+        // Bolinha branca embaixo do ícone que está com o menu aberto.
+        if (openMenu != NONE) {
+            fillPaint.color = Color.WHITE
+            canvas.drawCircle(iconCX[openMenu], barTop + barH - gap * 0.5f, gap * 0.28f, fillPaint)
+        }
+    }
+
+    /** Menu vazio do ícone que foi tocado (por enquanto só a janela, sem nada dentro). */
+    private fun drawPanel(canvas: Canvas) {
+        val m = openMenu
+        if (m == NONE) return
+        rect.set(panelLeft, panelTop, panelLeft + panelW, panelTop + panelH)
+        val r = gap * 1.6f
+        fillPaint.color = Color.argb(150, 20, 20, 20)
+        canvas.drawRoundRect(rect, r, r, fillPaint)
+        // Borda com a cor do ícone que abriu o menu.
+        panelBorderPaint.color = iconColors[m]
+        canvas.drawRoundRect(rect, r, r, panelBorderPaint)
+
+        // Barrinha branca embaixo do menu: serve para mover só este menu.
+        drawHandle(canvas, pHandleCX, pHandleCY, pHandleW, pHandleState)
     }
 
     private fun drawIcon(canvas: Canvas, i: Int) {
@@ -418,7 +533,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             fillPaint.color = Color.argb(70, 255, 255, 255)
             canvas.drawRoundRect(rect, radius, radius, fillPaint)
         } else if (state == 2) {
-            canvas.drawRoundRect(rect, radius, radius, grabRingPaint)
+            canvas.drawRoundRect(rect, radius, radius, pressRingPaint)
         }
     }
 
@@ -434,9 +549,13 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val PINCH_START = 0.30f
         const val PINCH_RELEASE = 0.45f
 
+        const val TAP_MAX_MS = 900L     // pinça mais curta que isso (sem a mão se afastar) = toque
+        const val DRAG_START = 0.4f     // quanto a mão pode se afastar (em tamanhos de ícone) e ainda ser toque
+
         const val ICON_COUNT = 3
         const val MAX_HANDS = 4
         const val NONE = -1
-        const val HANDLE = ICON_COUNT   // alvo "barrinha de mover a barra"
+        const val HANDLE = ICON_COUNT          // barrinha que move a barra
+        const val PANEL_HANDLE = ICON_COUNT + 1  // barrinha que move o menu aberto
     }
 }
