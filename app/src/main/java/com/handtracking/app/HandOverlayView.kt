@@ -9,6 +9,7 @@ import android.graphics.RectF
 import android.os.SystemClock
 import android.util.AttributeSet
 import android.view.MotionEvent
+import android.view.Surface
 import android.view.View
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
@@ -16,6 +17,7 @@ import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 /**
  * Desenha o esqueleto da mão e uma barra flutuante com 3 ícones (verde, vermelho e azul).
@@ -27,6 +29,9 @@ import kotlin.math.min
  *  - Menu vermelho (modo normal): mostra o YouTube; a pinça funciona como o dedo na tela
  *    (pinça rápida = clique, pinça e arrastar = rolar).
  * No modo VR Box também desenha a imagem da câmera e repete tudo para os dois olhos.
+ *
+ * Modo 3D ("mundo"): com a câmera traseira e o giroscópio, a barra e os menus ficam parados
+ * no espaço. Se você vira a cabeça, eles saem da tela e ficam no lugar onde você os deixou.
  */
 class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs) {
 
@@ -164,6 +169,26 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     private var lastWebPY = 0f
     private var panelCorner = 0f
 
+    // ---- Modo 3D ("mundo"): a barra e os menus ficam parados no espaço, usando o giroscópio ----
+    /** true = usa o giroscópio (só com a câmera traseira). false = tudo preso na tela, como antes. */
+    @Volatile var worldMode: Boolean = false
+        set(value) {
+            field = value
+            anchorsPending = true
+            panelMoved.fill(false)
+            postInvalidate()
+        }
+    @Volatile private var liveRot: FloatArray? = null    // giroscópio mais recente (dispositivo -> mundo)
+    @Volatile private var frameRot: FloatArray? = null   // giroscópio na hora do frame (VR Box)
+    private var rot: FloatArray? = null                  // matriz usada no desenho atual
+    private var worldActive = false
+    private var anchorsPending = true                    // precisa (re)posicionar a barra à frente
+    private val eRight = floatArrayOf(1f, 0f, 0f)        // direita da tela, nos eixos do aparelho
+    private val eUp = floatArrayOf(0f, 1f, 0f)           // cima da tela, nos eixos do aparelho
+    private val barDir = FloatArray(3)                   // direção da barra no mundo
+    private val panelDir = Array(ICON_COUNT) { FloatArray(3) }  // direção de cada menu no mundo
+    private val tmp2 = FloatArray(2)
+
     fun setResults(newResult: HandLandmarkerResult?, width: Int, height: Int) {
         result = newResult
         imageWidth = width
@@ -171,10 +196,80 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         postInvalidate()
     }
 
-    /** Usado só no modo VR Box: último frame da câmera (já girado/espelhado). */
-    fun setFrame(bitmap: Bitmap) {
+    /** Usado só no modo VR Box: último frame da câmera (já girado/espelhado) e o giroscópio daquela hora. */
+    fun setFrame(bitmap: Bitmap, rotation: FloatArray? = null) {
         frame = bitmap
+        frameRot = rotation
         postInvalidate()
+    }
+
+    /** Giroscópio: matriz 3x3 (dispositivo -> mundo), vinda do SensorManager. */
+    fun setGyro(matrix: FloatArray) {
+        liveRot = matrix
+        if (worldMode && !vrMode) postInvalidate()
+    }
+
+    fun currentRotation(): FloatArray? = liveRot
+
+    /** Rotação da tela (Surface.ROTATION_*): diz onde ficam a direita e o cima da tela no aparelho. */
+    fun setDisplayRotation(rotation: Int) {
+        when (rotation) {
+            Surface.ROTATION_90 -> setAxes(0f, 1f, 0f, -1f, 0f, 0f)
+            Surface.ROTATION_180 -> setAxes(-1f, 0f, 0f, 0f, -1f, 0f)
+            Surface.ROTATION_270 -> setAxes(0f, -1f, 0f, 1f, 0f, 0f)
+            else -> setAxes(1f, 0f, 0f, 0f, 1f, 0f)
+        }
+        postInvalidate()
+    }
+
+    private fun setAxes(rx: Float, ry: Float, rz: Float, ux: Float, uy: Float, uz: Float) {
+        eRight[0] = rx; eRight[1] = ry; eRight[2] = rz
+        eUp[0] = ux; eUp[1] = uy; eUp[2] = uz
+    }
+
+    /** Traz a barra de volta para a frente de você (e os menus voltam a acompanhar a barra). */
+    fun recenter() {
+        anchorsPending = true
+        postInvalidate()
+    }
+
+    // Distância focal da câmera, em pixels da imagem (supõe ~66 graus no lado maior).
+    private fun focal(iw: Float, ih: Float): Float = max(iw, ih) / 2f / TAN_HALF_FOV
+
+    /** Direção do mundo -> ponto na imagem. Devolve false se estiver atrás da câmera. */
+    private fun project(dir: FloatArray, iw: Float, ih: Float, out: FloatArray): Boolean {
+        val r = rot ?: return false
+        // Direção nos eixos do aparelho (R transposta vezes a direção).
+        val dx = r[0] * dir[0] + r[3] * dir[1] + r[6] * dir[2]
+        val dy = r[1] * dir[0] + r[4] * dir[1] + r[7] * dir[2]
+        val dz = r[2] * dir[0] + r[5] * dir[1] + r[8] * dir[2]
+        val fwd = -dz   // a câmera traseira olha para -Z
+        if (fwd < 0.05f) return false
+        val right = dx * eRight[0] + dy * eRight[1] + dz * eRight[2]
+        val up = dx * eUp[0] + dy * eUp[1] + dz * eUp[2]
+        val f = focal(iw, ih)
+        out[0] = (iw / 2f + f * right / fwd).coerceIn(-OFFSCREEN, OFFSCREEN)
+        out[1] = (ih / 2f - f * up / fwd).coerceIn(-OFFSCREEN, OFFSCREEN)
+        return true
+    }
+
+    /** Ponto na imagem -> direção do mundo. */
+    private fun unproject(x: Float, y: Float, iw: Float, ih: Float, out: FloatArray) {
+        val r = rot ?: return
+        val f = focal(iw, ih)
+        val a = (x - iw / 2f) / f
+        val b = -(y - ih / 2f) / f
+        val vx = a * eRight[0] + b * eUp[0]
+        val vy = a * eRight[1] + b * eUp[1]
+        val vz = a * eRight[2] + b * eUp[2] - 1f
+        val wx = r[0] * vx + r[1] * vy + r[2] * vz
+        val wy = r[3] * vx + r[4] * vy + r[5] * vz
+        val wz = r[6] * vx + r[7] * vy + r[8] * vz
+        val n = sqrt(wx * wx + wy * wy + wz * wz)
+        if (n < 1e-6f) return
+        out[0] = wx / n
+        out[1] = wy / n
+        out[2] = wz / n
     }
 
     fun clear() {
@@ -191,6 +286,9 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         val iw = (bmp?.width ?: imageWidth).toFloat()
         val ih = (bmp?.height ?: imageHeight).toFloat()
         touchScale = min(width / iw, height / ih)
+        // No VR Box usa o giroscópio da hora do frame (a imagem e o menu ficam combinados).
+        rot = if (vrMode) (frameRot ?: liveRot) else liveRot
+        worldActive = worldMode && rot != null
         updateScene(iw, ih)
 
         if (vrMode) {
@@ -235,8 +333,18 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         gap = iconS * 0.25f
         barW = ICON_COUNT * iconS + (ICON_COUNT + 1) * gap
         barH = iconS + 2f * gap
-        barCX = barNX * iw
-        barCY = barNY * ih
+        if (worldActive) {
+            if (project(barDir, iw, ih, tmp2)) {
+                barCX = tmp2[0]
+                barCY = tmp2[1]
+            } else {
+                barCX = -OFFSCREEN   // atrás de você: fora da tela
+                barCY = -OFFSCREEN
+            }
+        } else {
+            barCX = barNX * iw
+            barCY = barNY * ih
+        }
         barLeft = barCX - barW / 2f
         barTop = barCY - barH / 2f
 
@@ -266,18 +374,34 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             val left: Float
             val top: Float
             if (panelMoved[m]) {
-                left = panelNX[m] * iw - panelW / 2f
-                top = panelNY[m] * ih - panelH / 2f
+                if (worldActive) {
+                    if (project(panelDir[m], iw, ih, tmp2)) {
+                        left = tmp2[0] - panelW / 2f
+                        top = tmp2[1] - panelH / 2f
+                    } else {
+                        left = -OFFSCREEN
+                        top = -OFFSCREEN
+                    }
+                } else {
+                    left = panelNX[m] * iw - panelW / 2f
+                    top = panelNY[m] * ih - panelH / 2f
+                }
             } else {
                 // Padrão: em cima da barra (ou embaixo dela, se não couber em cima).
                 left = barCX - panelW / 2f
                 val aboveTop = barTop - gap * 3.2f - panelH
-                top = if (aboveTop >= margin) aboveTop else handleCY + gap * 2.2f
+                top = if (worldActive || aboveTop >= margin) aboveTop else handleCY + gap * 2.2f
             }
-            val maxLeft = max(margin, iw - margin - panelW)
-            val maxTop = max(margin, ih - margin - panelH - gap * 2.5f)
-            panelLeft = left.coerceIn(margin, maxLeft)
-            panelTop = top.coerceIn(margin, maxTop)
+            if (worldActive) {
+                // No modo 3D o menu pode sair da tela: ele fica parado no espaço.
+                panelLeft = left
+                panelTop = top
+            } else {
+                val maxLeft = max(margin, iw - margin - panelW)
+                val maxTop = max(margin, ih - margin - panelH - gap * 2.5f)
+                panelLeft = left.coerceIn(margin, maxLeft)
+                panelTop = top.coerceIn(margin, maxTop)
+            }
             pHandleCX = panelLeft + panelW / 2f
             pHandleCY = panelTop + panelH + gap * 1.3f
         }
@@ -292,6 +416,13 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         if (!sceneReady) return
 
         handleH = max(min(iw, ih) * 0.012f, 5f)
+
+        if (worldActive && anchorsPending) {
+            // Põe a barra no meio da imagem de agora, parada no espaço.
+            unproject(iw * 0.5f, ih * 0.55f, iw, ih, barDir)
+            panelMoved.fill(false)
+            anchorsPending = false
+        }
         applyGeometry(iw, ih)
 
         for (i in 0 until ICON_COUNT) iconTouch[i] = false
@@ -460,18 +591,28 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
                 when (grabbed) {
                     HANDLE -> {
-                        val nx = (pinchX[idx] + grabOffsetX) / iw
-                        val ny = (pinchY[idx] + grabOffsetY) / ih
-                        val halfW = min(barW / 2f / iw, 0.49f)
-                        barNX = nx.coerceIn(halfW, 1f - halfW)
-                        barNY = ny.coerceIn(0.10f, 0.82f)
+                        val cx = pinchX[idx] + grabOffsetX
+                        val cy = pinchY[idx] + grabOffsetY
+                        if (worldActive) {
+                            unproject(cx, cy, iw, ih, barDir)
+                        } else {
+                            val halfW = min(barW / 2f / iw, 0.49f)
+                            barNX = (cx / iw).coerceIn(halfW, 1f - halfW)
+                            barNY = (cy / ih).coerceIn(0.10f, 0.82f)
+                        }
                     }
                     PANEL_HANDLE -> {
                         val m = openMenu
                         if (m != NONE) {
+                            val cx = pinchX[idx] + grabOffsetX
+                            val cy = pinchY[idx] + grabOffsetY
                             panelMoved[m] = true
-                            panelNX[m] = ((pinchX[idx] + grabOffsetX) / iw).coerceIn(0f, 1f)
-                            panelNY[m] = ((pinchY[idx] + grabOffsetY) / ih).coerceIn(0f, 1f)
+                            if (worldActive) {
+                                unproject(cx, cy, iw, ih, panelDir[m])
+                            } else {
+                                panelNX[m] = (cx / iw).coerceIn(0f, 1f)
+                                panelNY[m] = (cy / ih).coerceIn(0f, 1f)
+                            }
                         }
                     }
                     PANEL_CONTENT -> {
@@ -642,6 +783,9 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
         const val TAP_MAX_MS = 900L     // pinça mais curta que isso (sem a mão se afastar) = toque
         const val DRAG_START = 0.4f     // quanto a mão pode se afastar (em tamanhos de ícone) e ainda ser toque
+
+        const val TAN_HALF_FOV = 0.6494f   // tan(33 graus): câmera com ~66 graus no lado maior da imagem
+        const val OFFSCREEN = 100000f      // "bem longe da tela"
 
         const val ICON_COUNT = 3
         const val YOUTUBE_ICON = 1   // o ícone vermelho abre o YouTube
