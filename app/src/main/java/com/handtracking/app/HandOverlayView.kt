@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
 import android.os.SystemClock
@@ -21,7 +22,7 @@ import kotlin.math.min
 import kotlin.math.sqrt
 
 /**
- * Desenha o esqueleto da mão e uma barra flutuante com 3 ícones (verde, vermelho e azul).
+ * Desenha o esqueleto da mão e uma barra flutuante com 4 ícones (verde, vermelho, azul e amarelo).
  *  - Encostar o dedo indicador num ícone: ele cresce um pouco e acende.
  *  - Pinça rápida (fechar e abrir os dedos) num ícone: abre (ou fecha) o menu daquele ícone.
  *  - Os ícones ficam sempre no lugar (não dá para arrastar).
@@ -29,6 +30,8 @@ import kotlin.math.sqrt
  *  - Pinça na barrinha branca embaixo de um menu: move só aquele menu.
  *  - Menu vermelho (modo normal): mostra o YouTube; a pinça funciona como o dedo na tela
  *    (pinça rápida = clique, pinça e arrastar = rolar).
+ *  - Menu amarelo: mini jogo de empilhar blocos (pinça num bloco para pegar, solta para cair;
+ *    o botão redondo no canto reinicia).
  * No modo VR Box também desenha a imagem da câmera e repete tudo para os dois olhos.
  *
  * Modo 3D ("mundo"): com a câmera traseira e o giroscópio, a barra e os menus ficam parados
@@ -100,7 +103,8 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     private val iconColors = intArrayOf(
         Color.rgb(67, 160, 71),   // verde
         Color.rgb(229, 57, 53),   // vermelho
-        Color.rgb(30, 136, 229)   // azul
+        Color.rgb(30, 136, 229),  // azul
+        Color.rgb(251, 192, 45)   // amarelo (mini jogo)
     )
 
     // Posição do CENTRO da barra, de 0 a 1 (fração da imagem da câmera).
@@ -177,6 +181,45 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     var onVrWebTouch: ((Int, Float, Float) -> Unit)? = null
     @Volatile private var webFrame: Bitmap? = null
     private val webSrc = Rect(0, 0, WebTexture.WIDTH, WebTexture.HEIGHT)
+
+    // ---- Mini jogo: empilhar blocos (4º ícone, amarelo) ----
+    // Unidade do jogo: 1,0 = largura do menu. A altura do menu é GAME_ASPECT (o chão fica embaixo).
+    private val gX = FloatArray(GAME_BLOCKS)        // lado esquerdo do bloco
+    private val gY = FloatArray(GAME_BLOCKS)        // topo do bloco (cresce para baixo)
+    private val gW = floatArrayOf(0.20f, 0.17f, 0.15f, 0.19f, 0.13f)   // largura de cada bloco
+    private val gVX = FloatArray(GAME_BLOCKS)
+    private val gVY = FloatArray(GAME_BLOCKS)
+    private val gSupport = IntArray(GAME_BLOCKS)    // em cima de quem (-1 = chão, -2 = no ar)
+    private val gLevel = IntArray(GAME_BLOCKS)      // andar na torre (0 = fora da torre)
+    private val gOrder = IntArray(GAME_BLOCKS)
+    private val gTouch = BooleanArray(GAME_BLOCKS)  // dedo indicador encostando no bloco
+    private val gColors = intArrayOf(
+        Color.rgb(239, 83, 80),
+        Color.rgb(255, 202, 40),
+        Color.rgb(66, 165, 245),
+        Color.rgb(171, 71, 188),
+        Color.rgb(102, 187, 106)
+    )
+    private var gameHeld = -1
+    private var gameReady = false
+    private var gameLastMs = 0L
+    private var gameTower = 0
+    private var gameBest = 0
+    private var resetCX = 0f
+    private var resetCY = 0f
+    private var resetR = 0f
+    private var resetTouch = false
+    private val textPaint = Paint().apply {
+        color = Color.WHITE
+        isAntiAlias = true
+        isFakeBoldText = true
+    }
+    private val arrowPaint = Paint().apply {
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        color = Color.rgb(40, 40, 40)
+    }
+    private val arrowPath = Path()
 
     // ---- Modo 3D ("mundo"): a barra e os menus ficam parados no espaço, usando o giroscópio ----
     /** true = usa o giroscópio (só com a câmera traseira). false = tudo preso na tela, como antes. */
@@ -344,7 +387,13 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         }
 
         notifyWebPanel(iw, ih)
+
+        // O jogo precisa redesenhar sempre (os blocos caem sozinhos).
+        if (isGameOpen()) postInvalidateOnAnimation()
     }
+
+    /** O menu amarelo é o jogo de empilhar blocos. */
+    private fun isGameOpen(): Boolean = openMenu == GAME_ICON
 
     /** O menu vermelho mostra o YouTube (nos dois modos). */
     private fun isWebOpen(): Boolean = openMenu == YOUTUBE_ICON
@@ -433,6 +482,10 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             panelH = min(u * 0.45f, max(room, u * 0.2f))
             panelW = min(panelH / aspect, iw * 0.9f)
             panelH = panelW * aspect
+        } else if (isGameOpen()) {
+            // Jogo: janela mais alta; o tamanho dos blocos é sempre proporcional à largura.
+            panelW = min(u * 0.72f, iw * 0.9f)
+            panelH = panelW * GAME_ASPECT
         } else {
             panelW = min(u * 0.62f, iw * 0.9f)
             panelH = u * 0.30f
@@ -474,6 +527,20 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             }
             pHandleCX = panelLeft + panelW / 2f
             pHandleCY = panelTop + panelH + gap * 1.3f
+            resetR = panelW * 0.05f
+            resetCX = panelLeft + panelW - panelW * 0.075f
+            resetCY = panelTop + panelW * 0.075f
+        }
+    }
+
+    /** Ao abrir o jogo, a barra desce para sobrar espaço em cima (o jogo usa uma janela grande). */
+    private fun lowerBarForGame(iw: Float, ih: Float) {
+        val targetY = ih * GAME_BAR_Y
+        if (barCY >= targetY) return
+        if (worldActive) {
+            unproject(barCX, targetY, iw, ih, barDir)
+        } else {
+            barNY = (targetY / ih).coerceIn(0.10f, 0.82f)
         }
     }
 
@@ -496,6 +563,8 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         applyGeometry(iw, ih)
 
         for (i in 0 until ICON_COUNT) iconTouch[i] = false
+        for (b in 0 until GAME_BLOCKS) gTouch[b] = false
+        resetTouch = false
         var handleTouch = false
         var pHandleTouch = false
         pinchCount = 0
@@ -515,6 +584,15 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 }
                 if (abs(fx - handleCX) <= handleW / 2f && abs(fy - handleCY) <= iconS * 0.5f) {
                     handleTouch = true
+                }
+                if (isGameOpen()) {
+                    val blockH = GAME_BLOCK_H * panelW
+                    for (b in 0 until GAME_BLOCKS) {
+                        val bl = panelLeft + gX[b] * panelW
+                        val bt = panelTop + gY[b] * panelW
+                        if (fx >= bl && fx <= bl + gW[b] * panelW && fy >= bt && fy <= bt + blockH) gTouch[b] = true
+                    }
+                    if (abs(fx - resetCX) <= resetR * 1.4f && abs(fy - resetCY) <= resetR * 1.4f) resetTouch = true
                 }
                 if (openMenu != NONE &&
                     abs(fx - pHandleCX) <= pHandleW / 2f && abs(fy - pHandleCY) <= iconS * 0.5f
@@ -540,6 +618,11 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     }
                 }
             }
+        }
+
+        if ((grabbed == GAME_BLOCK || grabbed == GAME_RESET) && (!isGameOpen() || (grabbed == GAME_BLOCK && gameHeld < 0))) {
+            grabbed = NONE
+            gameHeld = -1
         }
 
         if (grabbed == NONE) {
@@ -581,6 +664,32 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     }
                 }
             }
+            if (best == NONE && isGameOpen()) {
+                // Pinça no botão de reiniciar ou num bloco do jogo.
+                val tol = iconS * 0.25f
+                val blockH = GAME_BLOCK_H * panelW
+                var bd = Float.MAX_VALUE
+                for (p in 0 until pinchCount) {
+                    if (abs(pinchX[p] - resetCX) <= resetR * 1.4f && abs(pinchY[p] - resetCY) <= resetR * 1.4f) {
+                        best = GAME_RESET
+                        bestIdx = p
+                        break
+                    }
+                    for (b in 0 until GAME_BLOCKS) {
+                        val cx = panelLeft + (gX[b] + gW[b] / 2f) * panelW
+                        val cy = panelTop + (gY[b] + GAME_BLOCK_H / 2f) * panelW
+                        if (abs(pinchX[p] - cx) <= gW[b] * panelW / 2f + tol && abs(pinchY[p] - cy) <= blockH / 2f + tol) {
+                            val d = hypot(pinchX[p] - cx, pinchY[p] - cy)
+                            if (d < bd) {
+                                bd = d
+                                best = GAME_BLOCK
+                                bestIdx = p
+                                gameHeld = b
+                            }
+                        }
+                    }
+                }
+            }
             if (best != NONE) {
                 grabbed = best
                 grabStartTime = SystemClock.uptimeMillis()
@@ -595,6 +704,13 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     PANEL_HANDLE -> {
                         grabOffsetX = panelLeft + panelW / 2f - pinchX[bestIdx]
                         grabOffsetY = panelTop + panelH / 2f - pinchY[bestIdx]
+                    }
+                    GAME_BLOCK -> {
+                        val b = gameHeld
+                        grabOffsetX = panelLeft + (gX[b] + gW[b] / 2f) * panelW - pinchX[bestIdx]
+                        grabOffsetY = panelTop + (gY[b] + GAME_BLOCK_H / 2f) * panelW - pinchY[bestIdx]
+                        gVX[b] = 0f
+                        gVY[b] = 0f
                     }
                     PANEL_CONTENT -> {
                         grabOffsetX = 0f
@@ -616,6 +732,15 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     SystemClock.uptimeMillis() - grabStartTime <= TAP_MAX_MS
                 ) {
                     openMenu = if (openMenu == grabbed) NONE else grabbed
+                    if (openMenu == GAME_ICON && !panelMoved[GAME_ICON]) lowerBarForGame(iw, ih)
+                }
+                if (grabbed == GAME_RESET && !tapCancelled &&
+                    SystemClock.uptimeMillis() - grabStartTime <= TAP_MAX_MS
+                ) {
+                    resetGame()
+                }
+                if (grabbed == GAME_BLOCK) {
+                    gameHeld = -1   // soltou: o bloco cai
                 }
                 if (grabbed == PANEL_CONTENT) {
                     emitWebTouch(MotionEvent.ACTION_UP, lastWebPX, lastWebPY)
@@ -638,6 +763,11 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     PANEL_CONTENT -> {
                         expectedX = lastWebPX
                         expectedY = lastWebPY
+                    }
+                    GAME_BLOCK -> {
+                        val b = gameHeld
+                        expectedX = panelLeft + (gX[b] + gW[b] / 2f) * panelW - grabOffsetX
+                        expectedY = panelTop + (gY[b] + GAME_BLOCK_H / 2f) * panelW - grabOffsetY
                     }
                     else -> {
                         expectedX = grabStartX
@@ -677,6 +807,18 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                             }
                         }
                     }
+                    GAME_BLOCK -> {
+                        val b = gameHeld
+                        if (b >= 0) {
+                            val cx = pinchX[idx] + grabOffsetX
+                            val cy = pinchY[idx] + grabOffsetY
+                            gX[b] = ((cx - panelLeft) / panelW - gW[b] / 2f).coerceIn(0f, 1f - gW[b])
+                            gY[b] = ((cy - panelTop) / panelW - GAME_BLOCK_H / 2f)
+                                .coerceIn(0f, GAME_ASPECT - GAME_BLOCK_H)
+                            gVX[b] = 0f
+                            gVY[b] = 0f
+                        }
+                    }
                     PANEL_CONTENT -> {
                         lastWebPX = pinchX[idx].coerceIn(panelLeft, panelLeft + panelW)
                         lastWebPY = pinchY[idx].coerceIn(panelTop, panelTop + panelH)
@@ -695,11 +837,202 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             }
         }
 
+        if (isGameOpen()) {
+            stepGame()
+        } else {
+            gameLastMs = 0L
+        }
+
         for (i in 0 until ICON_COUNT) {
             iconState[i] = if (grabbed == i) 2 else if (iconTouch[i]) 1 else 0
         }
         handleState = if (grabbed == HANDLE) 2 else if (handleTouch) 1 else 0
         pHandleState = if (grabbed == PANEL_HANDLE) 2 else if (pHandleTouch) 1 else 0
+    }
+
+    /** Coloca os blocos no alto, espalhados; eles caem sozinhos para o chão. */
+    private fun resetGame() {
+        for (i in 0 until GAME_BLOCKS) {
+            gX[i] = 0.01f + i * 0.2f
+            gY[i] = 0.02f + (i % 2) * 0.12f
+            gVX[i] = 0f
+            gVY[i] = 0f
+            gSupport[i] = -2
+            gLevel[i] = 0
+        }
+        gameHeld = -1
+        gameReady = true
+        gameLastMs = 0L
+        gameTower = 0
+    }
+
+    /** Um passo do jogo: gravidade, blocos que empilham, escorregam e a contagem da torre. */
+    private fun stepGame() {
+        if (!gameReady) resetGame()
+        val now = SystemClock.uptimeMillis()
+        val dt = if (gameLastMs == 0L) 0.016f else ((now - gameLastMs) / 1000f).coerceIn(0.001f, 0.05f)
+        gameLastMs = now
+        val bh = GAME_BLOCK_H
+        val floor = GAME_ASPECT
+        val holding = grabbed == GAME_BLOCK && gameHeld >= 0
+
+        // Ordem: do bloco mais baixo para o mais alto (os de baixo se acertam primeiro).
+        for (k in 0 until GAME_BLOCKS) gOrder[k] = k
+        for (a in 1 until GAME_BLOCKS) {
+            val v = gOrder[a]
+            var b = a - 1
+            while (b >= 0 && gY[gOrder[b]] < gY[v]) {
+                gOrder[b + 1] = gOrder[b]
+                b--
+            }
+            gOrder[b + 1] = v
+        }
+
+        for (k in 0 until GAME_BLOCKS) {
+            val i = gOrder[k]
+            if (holding && i == gameHeld) {
+                gSupport[i] = -2
+                continue
+            }
+            var supportTop = floor
+            var support = -1
+            val ci = gX[i] + gW[i] / 2f
+            for (j in 0 until GAME_BLOCKS) {
+                if (j == i) continue
+                val ov = min(gX[i] + gW[i], gX[j] + gW[j]) - max(gX[i], gX[j])
+                if (ov <= 0f) continue
+                if (gY[j] < gY[i] + bh * 0.5f) continue          // o outro não está embaixo de mim
+                if (ci >= gX[j] && ci <= gX[j] + gW[j]) {
+                    // Meu centro está sobre ele: ele me segura.
+                    if (gY[j] < supportTop) {
+                        supportTop = gY[j]
+                        support = j
+                    }
+                } else if (gY[i] + bh >= gY[j] - 0.01f) {
+                    // Só a pontinha encosta: escorrega para o lado e cai.
+                    gVX[i] = if (ci < gX[j] + gW[j] / 2f) -GAME_SLIDE else GAME_SLIDE
+                }
+            }
+
+            if (gY[i] + bh < supportTop - 0.0005f) {
+                gVY[i] = min(gVY[i] + GAME_GRAVITY * dt, 2.0f)
+                var ny = gY[i] + gVY[i] * dt
+                if (ny + bh >= supportTop) {
+                    ny = supportTop - bh
+                    gVY[i] = 0f
+                    gSupport[i] = support
+                } else {
+                    gSupport[i] = -2
+                }
+                gY[i] = ny
+            } else {
+                gY[i] = supportTop - bh
+                gVY[i] = 0f
+                gSupport[i] = support
+            }
+
+            gX[i] = (gX[i] + gVX[i] * dt).coerceIn(0f, 1f - gW[i])
+            gVX[i] *= max(0f, 1f - 6f * dt)
+            if (abs(gVX[i]) < 0.01f) gVX[i] = 0f
+        }
+
+        // Blocos lado a lado não ficam um dentro do outro (o bloco na sua mão empurra os outros).
+        for (a in 0 until GAME_BLOCKS) {
+            for (b in a + 1 until GAME_BLOCKS) {
+                val ovx = min(gX[a] + gW[a], gX[b] + gW[b]) - max(gX[a], gX[b])
+                if (ovx <= 0f) continue
+                val ovy = min(gY[a], gY[b]) + bh - max(gY[a], gY[b])
+                if (ovy <= bh * 0.5f) continue
+                val push = ovx * min(1f, 12f * dt)
+                val sa = if (gX[a] + gW[a] / 2f < gX[b] + gW[b] / 2f) -1f else 1f
+                val wa: Float
+                val wb: Float
+                if (holding && a == gameHeld) { wa = 0f; wb = 1f }
+                else if (holding && b == gameHeld) { wa = 1f; wb = 0f }
+                else if (abs(gY[a] - gY[b]) < bh * 0.3f) { wa = 0.5f; wb = 0.5f }
+                else if (gY[a] < gY[b]) { wa = 1f; wb = 0f }
+                else { wa = 0f; wb = 1f }
+                gX[a] = (gX[a] + sa * push * wa).coerceIn(0f, 1f - gW[a])
+                gX[b] = (gX[b] - sa * push * wb).coerceIn(0f, 1f - gW[b])
+            }
+        }
+
+        // Altura da torre: quantos blocos seguidos estão empilhados sobre o chão.
+        var tower = 0
+        for (k in 0 until GAME_BLOCKS) {
+            val i = gOrder[k]
+            val s = gSupport[i]
+            gLevel[i] = when {
+                holding && i == gameHeld -> 0
+                s == -1 -> 1
+                s >= 0 && gLevel[s] > 0 -> gLevel[s] + 1
+                else -> 0
+            }
+            if (gLevel[i] > tower) tower = gLevel[i]
+        }
+        gameTower = tower
+        if (tower > gameBest) gameBest = tower
+    }
+
+    /** Desenha chão, blocos, placar e o botão de reiniciar dentro do menu do jogo. */
+    private fun drawGame(canvas: Canvas) {
+        val bw = panelW
+        val blockH = GAME_BLOCK_H * bw
+
+        // Chão.
+        fillPaint.color = Color.argb(90, 255, 255, 255)
+        canvas.drawRect(panelLeft + bw * 0.01f, panelTop + panelH - bw * 0.012f, panelLeft + bw * 0.99f, panelTop + panelH, fillPaint)
+
+        // Blocos.
+        val radius = bw * 0.012f
+        for (i in 0 until GAME_BLOCKS) {
+            val l = panelLeft + gX[i] * bw
+            val t = panelTop + gY[i] * bw
+            rect.set(l, t, l + gW[i] * bw, t + blockH)
+            fillPaint.color = gColors[i]
+            canvas.drawRoundRect(rect, radius, radius, fillPaint)
+            canvas.drawRoundRect(rect, radius, radius, outlinePaint)
+            if (grabbed == GAME_BLOCK && gameHeld == i) {
+                canvas.drawRoundRect(rect, radius, radius, pressRingPaint)
+            } else if (gTouch[i]) {
+                fillPaint.color = Color.argb(70, 255, 255, 255)
+                canvas.drawRoundRect(rect, radius, radius, fillPaint)
+            }
+        }
+
+        // Placar.
+        textPaint.textSize = bw * 0.055f
+        textPaint.textAlign = Paint.Align.LEFT
+        val label = if (gameTower >= GAME_BLOCKS) "Torre completa!" else "Torre: $gameTower/$GAME_BLOCKS"
+        canvas.drawText(label, panelLeft + bw * 0.04f, panelTop + bw * 0.092f, textPaint)
+        textPaint.textAlign = Paint.Align.RIGHT
+        canvas.drawText("Recorde: $gameBest", resetCX - resetR * 1.5f, panelTop + bw * 0.092f, textPaint)
+
+        // Botão de reiniciar (círculo com uma seta).
+        fillPaint.color = when {
+            grabbed == GAME_RESET -> Color.YELLOW
+            resetTouch -> Color.WHITE
+            else -> Color.argb(210, 235, 235, 235)
+        }
+        canvas.drawCircle(resetCX, resetCY, resetR, fillPaint)
+        val rr = resetR * 0.5f
+        arrowPaint.strokeWidth = max(resetR * 0.18f, 2f)
+        rect.set(resetCX - rr, resetCY - rr, resetCX + rr, resetCY + rr)
+        canvas.drawArc(rect, -45f, 270f, false, arrowPaint)
+        // Ponta da seta no fim do arco (ângulo 225 graus, sentido horário).
+        val ex = resetCX - rr * 0.7071f
+        val ey = resetCY - rr * 0.7071f
+        val tx = 0.7071f    // direção do arco nesse ponto
+        val ty = -0.7071f
+        val nx = -0.7071f   // para fora do círculo
+        val ny = -0.7071f
+        arrowPath.reset()
+        arrowPath.moveTo(ex + tx * resetR * 0.45f, ey + ty * resetR * 0.45f)
+        arrowPath.lineTo(ex + nx * resetR * 0.3f, ey + ny * resetR * 0.3f)
+        arrowPath.lineTo(ex - nx * resetR * 0.3f, ey - ny * resetR * 0.3f)
+        arrowPath.close()
+        fillPaint.color = Color.rgb(40, 40, 40)
+        canvas.drawPath(arrowPath, fillPaint)
     }
 
     /** Desenha (imagem opcional +) menu + barra + esqueleto dentro de uma região da tela. */
@@ -806,6 +1139,8 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         panelBorderPaint.color = iconColors[m]
         canvas.drawRoundRect(rect, r, r, panelBorderPaint)
 
+        if (isGameOpen()) drawGame(canvas)
+
         // Barrinha branca embaixo do menu: serve para mover só este menu.
         drawHandle(canvas, pHandleCX, pHandleCY, pHandleW, pHandleState)
     }
@@ -854,12 +1189,23 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val TAN_HALF_FOV = 0.6494f   // tan(33 graus): câmera com ~66 graus no lado maior da imagem
         const val OFFSCREEN = 100000f      // "bem longe da tela"
 
-        const val ICON_COUNT = 3
+        const val ICON_COUNT = 4
         const val YOUTUBE_ICON = 1   // o ícone vermelho abre o YouTube
+        const val GAME_ICON = 3      // o ícone amarelo abre o jogo de empilhar blocos
         const val MAX_HANDS = 4
         const val NONE = -1
         const val HANDLE = ICON_COUNT          // barrinha que move a barra
         const val PANEL_HANDLE = ICON_COUNT + 1  // barrinha que move o menu aberto
         const val PANEL_CONTENT = ICON_COUNT + 2 // pinça dentro do YouTube (clicar/rolar)
+        const val GAME_BLOCK = ICON_COUNT + 3    // pinça segurando um bloco do jogo
+        const val GAME_RESET = ICON_COUNT + 4    // pinça no botão de reiniciar o jogo
+
+        // Jogo de empilhar blocos (unidade: 1,0 = largura do menu).
+        const val GAME_BLOCKS = 5
+        const val GAME_BLOCK_H = 0.105f   // altura de cada bloco
+        const val GAME_ASPECT = 0.66f     // altura do menu do jogo / largura
+        const val GAME_GRAVITY = 2.6f
+        const val GAME_SLIDE = 0.5f       // velocidade de quem escorrega da ponta de outro bloco
+        const val GAME_BAR_Y = 0.80f      // a barra desce até aqui ao abrir o jogo
     }
 }
