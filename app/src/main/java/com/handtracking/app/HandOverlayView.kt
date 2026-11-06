@@ -30,6 +30,7 @@ import kotlin.math.sqrt
  *  - Pinça na barrinha branca embaixo de um menu: move só aquele menu.
  *  - Menu vermelho (modo normal): mostra o YouTube; a pinça funciona como o dedo na tela
  *    (pinça rápida = clique, pinça e arrastar = rolar).
+ *  - Menu verde: configurações (estilo da mão: normal ou estilo Meta Quest; fica salvo no aparelho).
  *  - Menu amarelo: mini jogo de empilhar blocos (pinça num bloco para pegar, solta para cair;
  *    o botão redondo no canto reinicia).
  * No modo VR Box também desenha a imagem da câmera e repete tudo para os dois olhos.
@@ -181,6 +182,32 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     var onVrWebTouch: ((Int, Float, Float) -> Unit)? = null
     @Volatile private var webFrame: Bitmap? = null
     private val webSrc = Rect(0, 0, WebTexture.WIDTH, WebTexture.HEIGHT)
+
+    // ---- Configurações (1º ícone, verde): estilo da mão ----
+    private val prefs = context.getSharedPreferences("aether_mr", Context.MODE_PRIVATE)
+
+    /** Estilo da mão: STYLE_NORMAL (linhas e pontos) ou STYLE_QUEST (mão translúcida). Fica salvo. */
+    var handStyle: Int = prefs.getInt("hand_style", STYLE_NORMAL)
+        set(value) {
+            field = value
+            prefs.edit().putInt("hand_style", value).apply()
+            postInvalidate()
+        }
+
+    private val optL = FloatArray(STYLE_COUNT)      // cartões de escolha: lado esquerdo de cada um
+    private var optT = 0f                           // topo (igual para todos)
+    private var optW = 0f
+    private var optH = 0f
+    private val optTouch = BooleanArray(STYLE_COUNT)
+    private var optHeld = -1
+    private val lmX = FloatArray(21)                // pontos da mão em pixels da tela (para desenhar)
+    private val lmY = FloatArray(21)
+    private val questPaint = Paint().apply {
+        isAntiAlias = true
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val palmPath = Path()
 
     // ---- Mini jogo: empilhar blocos (4º ícone, amarelo) ----
     // Unidade do jogo: 1,0 = largura do menu. A altura do menu é GAME_ASPECT (o chão fica embaixo).
@@ -392,6 +419,9 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         if (isGameOpen()) postInvalidateOnAnimation()
     }
 
+    /** O menu verde é o das configurações. */
+    private fun isSettingsOpen(): Boolean = openMenu == SETTINGS_ICON
+
     /** O menu amarelo é o jogo de empilhar blocos. */
     private fun isGameOpen(): Boolean = openMenu == GAME_ICON
 
@@ -530,6 +560,12 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             resetR = panelW * 0.05f
             resetCX = panelLeft + panelW - panelW * 0.075f
             resetCY = panelTop + panelW * 0.075f
+            // Cartões de escolha do menu de configurações (dois lado a lado).
+            val pad = panelW * 0.05f
+            optW = (panelW - pad * (STYLE_COUNT + 1)) / STYLE_COUNT
+            optH = panelH * 0.52f
+            optT = panelTop + panelH * 0.40f
+            for (o in 0 until STYLE_COUNT) optL[o] = panelLeft + pad + o * (optW + pad)
         }
     }
 
@@ -564,6 +600,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
         for (i in 0 until ICON_COUNT) iconTouch[i] = false
         for (b in 0 until GAME_BLOCKS) gTouch[b] = false
+        for (o in 0 until STYLE_COUNT) optTouch[o] = false
         resetTouch = false
         var handleTouch = false
         var pHandleTouch = false
@@ -584,6 +621,11 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 }
                 if (abs(fx - handleCX) <= handleW / 2f && abs(fy - handleCY) <= iconS * 0.5f) {
                     handleTouch = true
+                }
+                if (isSettingsOpen()) {
+                    for (o in 0 until STYLE_COUNT) {
+                        if (fx >= optL[o] && fx <= optL[o] + optW && fy >= optT && fy <= optT + optH) optTouch[o] = true
+                    }
                 }
                 if (isGameOpen()) {
                     val blockH = GAME_BLOCK_H * panelW
@@ -624,6 +666,10 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             grabbed = NONE
             gameHeld = -1
         }
+        if (grabbed == SET_OPT && (!isSettingsOpen() || optHeld < 0)) {
+            grabbed = NONE
+            optHeld = -1
+        }
 
         if (grabbed == NONE) {
             // Tenta pegar: um ícone (toque), a barrinha da barra ou a barrinha do menu aberto.
@@ -662,6 +708,23 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                         bestIdx = p
                         break
                     }
+                }
+            }
+            if (best == NONE && isSettingsOpen()) {
+                // Pinça num cartão de estilo da mão.
+                val tol = iconS * 0.1f
+                for (p in 0 until pinchCount) {
+                    for (o in 0 until STYLE_COUNT) {
+                        if (pinchX[p] >= optL[o] - tol && pinchX[p] <= optL[o] + optW + tol &&
+                            pinchY[p] >= optT - tol && pinchY[p] <= optT + optH + tol
+                        ) {
+                            best = SET_OPT
+                            bestIdx = p
+                            optHeld = o
+                            break
+                        }
+                    }
+                    if (best != NONE) break
                 }
             }
             if (best == NONE && isGameOpen()) {
@@ -741,6 +804,14 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 }
                 if (grabbed == GAME_BLOCK) {
                     gameHeld = -1   // soltou: o bloco cai
+                }
+                if (grabbed == SET_OPT) {
+                    if (optHeld >= 0 && !tapCancelled &&
+                        SystemClock.uptimeMillis() - grabStartTime <= TAP_MAX_MS
+                    ) {
+                        handStyle = optHeld   // pinça rápida no cartão: escolhe esse estilo
+                    }
+                    optHeld = -1
                 }
                 if (grabbed == PANEL_CONTENT) {
                     emitWebTouch(MotionEvent.ACTION_UP, lastWebPX, lastWebPY)
@@ -1035,6 +1106,72 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         canvas.drawPath(arrowPath, fillPaint)
     }
 
+    /** Menu de configurações: título e dois cartões para escolher o estilo da mão. */
+    private fun drawSettings(canvas: Canvas) {
+        val bw = panelW
+        textPaint.textAlign = Paint.Align.LEFT
+        textPaint.color = Color.WHITE
+        textPaint.textSize = bw * 0.062f
+        canvas.drawText("Configurações", panelLeft + bw * 0.05f, panelTop + panelH * 0.17f, textPaint)
+        textPaint.textSize = bw * 0.045f
+        textPaint.color = Color.argb(210, 255, 255, 255)
+        canvas.drawText("Estilo da mão", panelLeft + bw * 0.05f, panelTop + panelH * 0.34f, textPaint)
+
+        val radius = gap * 1.2f
+        for (o in 0 until STYLE_COUNT) {
+            rect.set(optL[o], optT, optL[o] + optW, optT + optH)
+            val selected = handStyle == o
+            fillPaint.color = if (selected) Color.argb(120, 67, 160, 71) else Color.argb(110, 90, 90, 90)
+            canvas.drawRoundRect(rect, radius, radius, fillPaint)
+            if (optTouch[o]) {
+                fillPaint.color = Color.argb(60, 255, 255, 255)
+                canvas.drawRoundRect(rect, radius, radius, fillPaint)
+            }
+            if (grabbed == SET_OPT && optHeld == o) {
+                canvas.drawRoundRect(rect, radius, radius, pressRingPaint)
+            } else {
+                pinchPaint.color = if (selected) iconColors[SETTINGS_ICON] else Color.argb(100, 255, 255, 255)
+                canvas.drawRoundRect(rect, radius, radius, pinchPaint)
+                pinchPaint.color = Color.YELLOW
+            }
+
+            // Mini desenho de um dedo no estilo.
+            val cx = optL[o] + optW / 2f
+            val cy = optT + optH * 0.38f
+            val sz = optH * 0.22f
+            val x0 = cx - sz
+            val y0 = cy + sz * 0.6f
+            val x1 = cx
+            val y1 = cy - sz * 0.2f
+            val x2 = cx + sz
+            val y2 = cy - sz * 0.8f
+            if (o == STYLE_QUEST) {
+                questPaint.style = Paint.Style.STROKE
+                questPaint.color = QUEST_RIM
+                questPaint.strokeWidth = sz * 0.75f
+                canvas.drawLine(x0, y0, x1, y1, questPaint)
+                canvas.drawLine(x1, y1, x2, y2, questPaint)
+                questPaint.color = QUEST_BODY
+                questPaint.strokeWidth = sz * 0.55f
+                canvas.drawLine(x0, y0, x1, y1, questPaint)
+                canvas.drawLine(x1, y1, x2, y2, questPaint)
+            } else {
+                canvas.drawLine(x0, y0, x1, y1, linePaint)
+                canvas.drawLine(x1, y1, x2, y2, linePaint)
+                canvas.drawCircle(x0, y0, sz * 0.16f, pointPaint)
+                canvas.drawCircle(x1, y1, sz * 0.16f, pointPaint)
+                canvas.drawCircle(x2, y2, sz * 0.16f, pointPaint)
+            }
+
+            // Nome do estilo.
+            textPaint.textAlign = Paint.Align.CENTER
+            textPaint.color = Color.WHITE
+            textPaint.textSize = bw * 0.05f
+            canvas.drawText(if (o == STYLE_QUEST) "Meta Quest" else "Normal", cx, optT + optH * 0.88f, textPaint)
+        }
+        textPaint.color = Color.WHITE
+    }
+
     /** Desenha (imagem opcional +) menu + barra + esqueleto dentro de uma região da tela. */
     private fun drawRegion(
         canvas: Canvas,
@@ -1071,24 +1208,71 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
         val res = result ?: return
         for (hand in res.landmarks()) {
-            HandLandmarker.HAND_CONNECTIONS.forEach { connection ->
-                val a = hand[connection.start()]
-                val b = hand[connection.end()]
-                canvas.drawLine(
-                    a.x() * iw * scale + offsetX, a.y() * ih * scale + offsetY,
-                    b.x() * iw * scale + offsetX, b.y() * ih * scale + offsetY,
-                    linePaint
-                )
+            if (hand.size < 21) continue
+            for (k in 0 until 21) {
+                lmX[k] = hand[k].x() * iw * scale + offsetX
+                lmY[k] = hand[k].y() * ih * scale + offsetY
             }
-            for (point in hand) {
-                canvas.drawCircle(
-                    point.x() * iw * scale + offsetX,
-                    point.y() * ih * scale + offsetY,
-                    9f,
-                    pointPaint
-                )
+            if (handStyle == STYLE_QUEST) drawQuestHand(canvas) else drawNormalHand(canvas)
+        }
+    }
+
+    /** Estilo normal: linhas brancas e pontos azuis. */
+    private fun drawNormalHand(canvas: Canvas) {
+        HandLandmarker.HAND_CONNECTIONS.forEach { connection ->
+            canvas.drawLine(
+                lmX[connection.start()], lmY[connection.start()],
+                lmX[connection.end()], lmY[connection.end()],
+                linePaint
+            )
+        }
+        for (k in 0 until 21) {
+            canvas.drawCircle(lmX[k], lmY[k], 9f, pointPaint)
+        }
+    }
+
+    /** Estilo Meta Quest: mão cheia, translúcida, com borda clara e um pontinho branco no indicador. */
+    private fun drawQuestHand(canvas: Canvas) {
+        val hs = hypot(lmX[WRIST] - lmX[MIDDLE_MCP], lmY[WRIST] - lmY[MIDDLE_MCP])
+        if (hs < 4f) return
+        val rim = hs * 0.035f
+
+        // Tudo é desenhado opaco numa camada e a camada inteira fica translúcida (sem escurecer onde se cruza).
+        canvas.saveLayerAlpha(0f, 0f, width.toFloat(), height.toFloat(), QUEST_ALPHA)
+        for (pass in 0..1) {
+            val extra = if (pass == 0) rim * 2f else 0f    // 1ª passada: borda clara; 2ª: corpo
+            questPaint.color = if (pass == 0) QUEST_RIM else QUEST_BODY
+
+            // Palma da mão.
+            questPaint.style = Paint.Style.FILL_AND_STROKE
+            questPaint.strokeWidth = hs * 0.12f + extra
+            palmPath.reset()
+            palmPath.moveTo(lmX[0], lmY[0])
+            palmPath.lineTo(lmX[1], lmY[1])
+            palmPath.lineTo(lmX[5], lmY[5])
+            palmPath.lineTo(lmX[9], lmY[9])
+            palmPath.lineTo(lmX[13], lmY[13])
+            palmPath.lineTo(lmX[17], lmY[17])
+            palmPath.close()
+            canvas.drawPath(palmPath, questPaint)
+
+            // Dedos: polegar (1 a 4), indicador (5 a 8), médio, anelar e mindinho. Afinam até a ponta.
+            questPaint.style = Paint.Style.STROKE
+            for (f in 0 until 5) {
+                val base = 1 + f * 4
+                var w = hs * (if (f == 0) 0.19f else if (f == 4) 0.15f else 0.17f)
+                for (k in 0 until 3) {
+                    questPaint.strokeWidth = w + extra
+                    canvas.drawLine(lmX[base + k], lmY[base + k], lmX[base + k + 1], lmY[base + k + 1], questPaint)
+                    w *= 0.9f
+                }
             }
         }
+        canvas.restore()
+
+        // Pontinho branco na ponta do indicador (é ele que encosta nos ícones).
+        fillPaint.color = Color.WHITE
+        canvas.drawCircle(lmX[INDEX_TIP], lmY[INDEX_TIP], hs * 0.05f, fillPaint)
     }
 
     /** Barrinha branca (alça) usada para mover a barra ou um menu. */
@@ -1140,6 +1324,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         canvas.drawRoundRect(rect, r, r, panelBorderPaint)
 
         if (isGameOpen()) drawGame(canvas)
+        if (isSettingsOpen()) drawSettings(canvas)
 
         // Barrinha branca embaixo do menu: serve para mover só este menu.
         drawHandle(canvas, pHandleCX, pHandleCY, pHandleW, pHandleState)
@@ -1191,7 +1376,16 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
         const val ICON_COUNT = 4
         const val YOUTUBE_ICON = 1   // o ícone vermelho abre o YouTube
+        const val SETTINGS_ICON = 0  // o ícone verde abre as configurações
         const val GAME_ICON = 3      // o ícone amarelo abre o jogo de empilhar blocos
+
+        // Estilos da mão.
+        const val STYLE_NORMAL = 0
+        const val STYLE_QUEST = 1
+        const val STYLE_COUNT = 2
+        const val QUEST_ALPHA = 175   // transparência da mão estilo Meta Quest (0 a 255)
+        val QUEST_RIM = Color.rgb(228, 238, 255)    // borda clara
+        val QUEST_BODY = Color.rgb(150, 172, 210)   // corpo azul acinzentado
         const val MAX_HANDS = 4
         const val NONE = -1
         const val HANDLE = ICON_COUNT          // barrinha que move a barra
@@ -1199,6 +1393,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val PANEL_CONTENT = ICON_COUNT + 2 // pinça dentro do YouTube (clicar/rolar)
         const val GAME_BLOCK = ICON_COUNT + 3    // pinça segurando um bloco do jogo
         const val GAME_RESET = ICON_COUNT + 4    // pinça no botão de reiniciar o jogo
+        const val SET_OPT = ICON_COUNT + 5       // pinça num cartão de estilo da mão
 
         // Jogo de empilhar blocos (unidade: 1,0 = largura do menu).
         const val GAME_BLOCKS = 5
