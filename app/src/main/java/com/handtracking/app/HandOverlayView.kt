@@ -19,6 +19,7 @@ import kotlin.math.abs
 import kotlin.math.asin
 import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.exp
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -34,7 +35,8 @@ import kotlin.math.sqrt
  *  - Pinça na barrinha branca embaixo de um menu: move só aquele menu.
  *  - Menu vermelho (modo normal): mostra o YouTube; a pinça funciona como o dedo na tela
  *    (pinça rápida = clique, pinça e arrastar = rolar).
- *  - Menu verde: configurações (estilo da mão: normal ou estilo Meta Quest; fica salvo no aparelho).
+ *  - Menu verde: configurações, em duas abas. "Mão": estilo da mão (normal ou Meta Quest).
+ *    "Menu": formato da barra (horizontal, em arco ou vertical). As escolhas ficam salvas no aparelho.
  *  - Menu amarelo: mini jogo 3D de empilhar blocos numa mesa. Pinça num bloco: ele sobe e você leva
  *    até onde quer (a marca amarela na mesa mostra onde ele vai cair); solta para cair. Para ver a mesa
  *    de outros lados: vire a cabeça (a mesa "gira" junto) ou faça pinça na mesa e arraste. O botão
@@ -111,7 +113,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         Color.rgb(67, 160, 71),   // verde
         Color.rgb(229, 57, 53),   // vermelho
         Color.rgb(30, 136, 229),  // azul
-        Color.rgb(251, 192, 45)   // amarelo (mini jogo)
+        Color.rgb(245, 166, 35)   // âmbar (mini jogo)
     )
 
     // Posição do CENTRO da barra, de 0 a 1 (fração da imagem da câmera).
@@ -200,12 +202,51 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             postInvalidate()
         }
 
-    private val optL = FloatArray(STYLE_COUNT)      // cartões de escolha: lado esquerdo de cada um
+    /** Formato da barra: LAYOUT_HORIZONTAL, LAYOUT_ARC (em arco) ou LAYOUT_VERTICAL. Fica salvo. */
+    var menuLayout: Int = prefs.getInt("menu_layout", LAYOUT_HORIZONTAL)
+        set(value) {
+            field = value
+            prefs.edit().putInt("menu_layout", value).apply()
+            postInvalidate()
+        }
+
+    private var settingsTab = 0                     // aba aberta nas configurações: 0 = Mão, 1 = Menu
+    private val tabL = FloatArray(2)                // abas (esquerda de cada uma)
+    private var tabT = 0f
+    private var tabW = 0f
+    private var tabH = 0f
+    private val tabTouch = BooleanArray(2)
+    private var tabHeld = -1
+    private val optL = FloatArray(OPT_MAX)          // cartões de escolha: lado esquerdo de cada um
     private var optT = 0f                           // topo (igual para todos)
     private var optW = 0f
     private var optH = 0f
-    private val optTouch = BooleanArray(STYLE_COUNT)
+    private val optTouch = BooleanArray(OPT_MAX)
     private var optHeld = -1
+    // ---- Visual de vidro e animações da barra ----
+    private var barInit = false
+    private var arcCX = 0f                          // barra em arco: centro e raio do círculo, ângulos em graus
+    private var arcCY = 0f
+    private var arcR = 0f
+    private val iconScale = FloatArray(ICON_COUNT) { 1f }   // tamanho atual de cada ícone (cresce ao encostar)
+    private val iconGlow = FloatArray(ICON_COUNT)           // brilho em volta do ícone (0 a 1)
+    private val iconDot = FloatArray(ICON_COUNT)            // bolinha de "menu aberto" (0 a 1)
+    private var shownMenu = NONE                    // menu que está na tela (fica enquanto fecha)
+    private var panelAnim = 0f                      // 0 = fechado, 1 = aberto (animação suave)
+    private var animLastMs = 0L
+    private var animating = false
+    private val glyphPath = Path()
+    private val glassRingPaint = Paint().apply {
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        strokeWidth = 2.5f
+        color = Color.argb(140, 255, 255, 255)
+    }
+    private val bandPaint = Paint().apply {
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
     private val lmX = FloatArray(21)                // pontos da mão em pixels da tela (para desenhar)
     private val lmY = FloatArray(21)
     private val questPaint = Paint().apply {
@@ -469,7 +510,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         notifyWebPanel(iw, ih)
 
         // O jogo precisa redesenhar sempre (os blocos caem sozinhos).
-        if (isGameOpen()) postInvalidateOnAnimation()
+        if (isGameOpen() || animating) postInvalidateOnAnimation()
     }
 
     /** O menu verde é o das configurações. */
@@ -526,8 +567,13 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         val u = min(iw, ih)
         iconS = u * 0.13f
         gap = iconS * 0.25f
-        barW = ICON_COUNT * iconS + (ICON_COUNT + 1) * gap
-        barH = iconS + 2f * gap
+        if (menuLayout == LAYOUT_VERTICAL) {
+            barW = iconS + 2f * gap
+            barH = ICON_COUNT * iconS + (ICON_COUNT + 1) * gap
+        } else {
+            barW = ICON_COUNT * iconS + (ICON_COUNT + 1) * gap
+            barH = iconS + 2f * gap
+        }
         if (worldActive) {
             if (project(barDir, iw, ih, tmp2)) {
                 barCX = tmp2[0]
@@ -543,14 +589,54 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         barLeft = barCX - barW / 2f
         barTop = barCY - barH / 2f
 
-        handleW = barW * 0.6f
-        handleCX = barCX
-        handleCY = barTop + barH + gap * 1.2f
-
-        for (i in 0 until ICON_COUNT) {
-            iconCX[i] = barLeft + gap + iconS / 2f + i * (iconS + gap)
-            iconCY[i] = barCY
+        when (menuLayout) {
+            LAYOUT_VERTICAL -> {
+                for (i in 0 until ICON_COUNT) {
+                    iconCX[i] = barCX
+                    iconCY[i] = barTop + gap + iconS / 2f + i * (iconS + gap)
+                }
+            }
+            LAYOUT_ARC -> {
+                // Ícones numa curva (como um arco-íris). O centro da barra fica no meio da curva.
+                arcR = iconS * 2.4f
+                val spread = ARC_SPREAD * PI_F / 180f
+                var cosSum = 0f
+                for (i in 0 until ICON_COUNT) {
+                    val a = -spread + i * (2f * spread / (ICON_COUNT - 1))
+                    cosSum += cos(a)
+                }
+                val cbar = cosSum / ICON_COUNT
+                var minX = Float.MAX_VALUE
+                var maxX = -Float.MAX_VALUE
+                var minY = Float.MAX_VALUE
+                var maxY = -Float.MAX_VALUE
+                for (i in 0 until ICON_COUNT) {
+                    val a = -spread + i * (2f * spread / (ICON_COUNT - 1))
+                    iconCX[i] = barCX + arcR * sin(a)
+                    iconCY[i] = barCY - arcR * (cos(a) - cbar)
+                    minX = min(minX, iconCX[i])
+                    maxX = max(maxX, iconCX[i])
+                    minY = min(minY, iconCY[i])
+                    maxY = max(maxY, iconCY[i])
+                }
+                arcCX = barCX
+                arcCY = barCY + arcR * cbar
+                barLeft = minX - iconS / 2f - gap
+                barTop = minY - iconS / 2f - gap
+                barW = maxX - minX + iconS + 2f * gap
+                barH = maxY - minY + iconS + 2f * gap
+            }
+            else -> {
+                for (i in 0 until ICON_COUNT) {
+                    iconCX[i] = barLeft + gap + iconS / 2f + i * (iconS + gap)
+                    iconCY[i] = barCY
+                }
+            }
         }
+
+        handleW = max(barW * 0.6f, iconS * 1.1f)
+        handleCX = barLeft + barW / 2f
+        handleCY = barTop + barH + gap * 1.2f
 
         // Menu aberto.
         val margin = u * 0.03f
@@ -561,17 +647,25 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         } else if (isVrWeb()) {
             // YouTube no VR Box: janela no formato do vídeo (16:9), do tamanho que couber acima da barra.
             val aspect = WebTexture.HEIGHT.toFloat() / WebTexture.WIDTH
-            val room = barTop - gap * 3.2f - margin
+            val room = if (menuLayout == LAYOUT_VERTICAL) u * 0.45f else barTop - gap * 3.2f - margin
             panelH = min(u * 0.45f, max(room, u * 0.2f))
             panelW = min(panelH / aspect, iw * 0.9f)
             panelH = panelW * aspect
         } else if (isGameOpen()) {
             // Jogo: janela mais alta; o tamanho dos blocos é sempre proporcional à largura.
-            panelW = min(u * 0.68f, iw * 0.9f)
+            panelW = min(u * (if (menuLayout == LAYOUT_ARC) 0.60f else 0.68f), iw * 0.9f)
             panelH = panelW * GAME_ASPECT
         } else {
             panelW = min(u * 0.62f, iw * 0.9f)
             panelH = u * 0.30f
+        }
+        if (menuLayout == LAYOUT_VERTICAL && !worldActive) {
+            // Barra vertical: o menu abre ao lado dela, então só pode usar o espaço que sobra.
+            val availW = max(iw - margin - (barLeft + barW + gap * 2f), u * 0.3f)
+            if (panelW > availW) {
+                if (!isWebPanel()) panelH *= availW / panelW
+                panelW = availW
+            }
         }
         panelCorner = gap * 1.6f
         pHandleW = panelW * 0.5f
@@ -594,9 +688,16 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 }
             } else {
                 // Padrão: em cima da barra (ou embaixo dela, se não couber em cima).
-                left = barCX - panelW / 2f
-                val aboveTop = barTop - gap * 3.2f - panelH
-                top = if (worldActive || aboveTop >= margin) aboveTop else handleCY + gap * 2.2f
+                if (menuLayout == LAYOUT_VERTICAL) {
+                    // Ao lado da barra: à direita se couber, senão à esquerda.
+                    val rightLeft = barLeft + barW + gap * 2f
+                    left = if (worldActive || rightLeft + panelW <= iw - margin) rightLeft else barLeft - gap * 2f - panelW
+                    top = barCY - panelH / 2f
+                } else {
+                    left = barCX - panelW / 2f
+                    val aboveTop = barTop - gap * 3.2f - panelH
+                    top = if (worldActive || aboveTop >= margin) aboveTop else handleCY + gap * 2.2f
+                }
             }
             if (worldActive) {
                 // No modo 3D o menu pode sair da tela: ele fica parado no espaço.
@@ -613,12 +714,50 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             resetR = panelW * 0.05f
             resetCX = panelLeft + panelW - panelW * 0.075f
             resetCY = panelTop + panelW * 0.075f
-            // Cartões de escolha do menu de configurações (dois lado a lado).
+            // Abas e cartões de escolha do menu de configurações.
             val pad = panelW * 0.05f
-            optW = (panelW - pad * (STYLE_COUNT + 1)) / STYLE_COUNT
-            optH = panelH * 0.52f
-            optT = panelTop + panelH * 0.40f
-            for (o in 0 until STYLE_COUNT) optL[o] = panelLeft + pad + o * (optW + pad)
+            val cnt = optCount()
+            optW = (panelW - pad * (cnt + 1)) / cnt
+            optH = panelH * 0.60f
+            optT = panelTop + panelH * 0.32f
+            for (o in 0 until cnt) optL[o] = panelLeft + pad + o * (optW + pad)
+            tabW = panelW * 0.20f
+            tabH = panelH * 0.17f
+            tabT = panelTop + panelH * 0.07f
+            tabL[1] = panelLeft + panelW - pad - tabW
+            tabL[0] = tabL[1] - tabW - pad * 0.5f
+        }
+    }
+
+    /** Quantos cartões a aba aberta das configurações tem. */
+    private fun optCount(): Int = if (settingsTab == 0) STYLE_COUNT else LAYOUT_COUNT
+
+    /** Limita a altura (0 a 1) do centro da barra para ela e a barrinha dela caberem na tela. */
+    private fun clampBarNY(v: Float, ih: Float): Float {
+        if (menuLayout == LAYOUT_HORIZONTAL) return v.coerceIn(0.10f, 0.82f)
+        // Barra mais alta (arco ou vertical): ela e a barrinha de baixo precisam caber na tela.
+        val lo = (barH / 2f + iconS * 0.2f) / ih
+        val hi = 1f - (barH / 2f + gap * 1.2f + iconS * 0.15f) / ih
+        return v.coerceIn(lo, max(lo, hi))
+    }
+
+    /** Onde a barra fica por padrão: no meio (horizontal e arco) ou na esquerda (vertical). */
+    private fun barDefaultX(): Float = if (menuLayout == LAYOUT_VERTICAL) 0.12f else 0.5f
+
+    private fun barDefaultY(): Float = when (menuLayout) {
+        LAYOUT_VERTICAL -> 0.5f
+        LAYOUT_ARC -> 0.67f      // o arco é mais alto: desce um pouco para sobrar espaço para o menu em cima
+        else -> 0.55f
+    }
+
+    /** Depois de trocar o formato da barra, leva a barra para o lugar padrão desse formato. */
+    private fun relocateBarForLayout(iw: Float, ih: Float) {
+        panelMoved.fill(false)
+        if (worldActive) {
+            unproject(iw * barDefaultX(), ih * barDefaultY(), iw, ih, barDir)
+        } else {
+            barNX = barDefaultX()
+            barNY = barDefaultY()
         }
     }
 
@@ -626,7 +765,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     private fun lowerBarForGame(iw: Float, ih: Float) {
         val halfW = min(barW / 2f / iw, 0.49f)
         barNX = (barCX / iw).coerceIn(halfW, 1f - halfW)
-        barNY = (max(barCY, ih * GAME_BAR_Y) / ih).coerceIn(0.10f, 0.82f)
+        barNY = if (menuLayout == LAYOUT_VERTICAL) clampBarNY(barCY / ih, ih) else clampBarNY(max(barCY, ih * GAME_BAR_Y) / ih, ih)
     }
 
     /**
@@ -639,9 +778,14 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
         handleH = max(min(iw, ih) * 0.012f, 5f)
 
+        if (!barInit) {
+            barInit = true
+            barNX = barDefaultX()
+            barNY = barDefaultY()
+        }
         if (worldActive && anchorsPending) {
-            // Põe a barra no meio da imagem de agora, parada no espaço.
-            unproject(iw * 0.5f, ih * 0.55f, iw, ih, barDir)
+            // Põe a barra no lugar padrão da imagem de agora, parada no espaço.
+            unproject(iw * barDefaultX(), ih * barDefaultY(), iw, ih, barDir)
             panelMoved.fill(false)
             anchorsPending = false
         }
@@ -649,7 +793,9 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
         for (i in 0 until ICON_COUNT) iconTouch[i] = false
         for (b in 0 until GAME_BLOCKS) gTouch[b] = false
-        for (o in 0 until STYLE_COUNT) optTouch[o] = false
+        for (o in 0 until OPT_MAX) optTouch[o] = false
+        tabTouch[0] = false
+        tabTouch[1] = false
         resetTouch = false
         var handleTouch = false
         var pHandleTouch = false
@@ -672,8 +818,11 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     handleTouch = true
                 }
                 if (isSettingsOpen()) {
-                    for (o in 0 until STYLE_COUNT) {
+                    for (o in 0 until optCount()) {
                         if (fx >= optL[o] && fx <= optL[o] + optW && fy >= optT && fy <= optT + optH) optTouch[o] = true
+                    }
+                    for (t in 0 until 2) {
+                        if (fx >= tabL[t] && fx <= tabL[t] + tabW && fy >= tabT && fy <= tabT + tabH) tabTouch[t] = true
                     }
                 }
                 if (isGameOpen()) {
@@ -708,9 +857,12 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             grabbed = NONE
             gameHeld = -1
         }
-        if (grabbed == SET_OPT && (!isSettingsOpen() || optHeld < 0)) {
+        if ((grabbed == SET_OPT && (!isSettingsOpen() || optHeld < 0)) ||
+            (grabbed == SET_TAB && (!isSettingsOpen() || tabHeld < 0))
+        ) {
             grabbed = NONE
             optHeld = -1
+            tabHeld = -1
         }
 
         if (grabbed == NONE) {
@@ -753,10 +905,21 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 }
             }
             if (best == NONE && isSettingsOpen()) {
-                // Pinça num cartão de estilo da mão.
+                // Pinça numa aba ou num cartão de escolha.
                 val tol = iconS * 0.1f
                 for (p in 0 until pinchCount) {
-                    for (o in 0 until STYLE_COUNT) {
+                    for (t in 0 until 2) {
+                        if (pinchX[p] >= tabL[t] - tol && pinchX[p] <= tabL[t] + tabW + tol &&
+                            pinchY[p] >= tabT - tol && pinchY[p] <= tabT + tabH + tol
+                        ) {
+                            best = SET_TAB
+                            bestIdx = p
+                            tabHeld = t
+                            break
+                        }
+                    }
+                    if (best != NONE) break
+                    for (o in 0 until optCount()) {
                         if (pinchX[p] >= optL[o] - tol && pinchX[p] <= optL[o] + optW + tol &&
                             pinchY[p] >= optT - tol && pinchY[p] <= optT + optH + tol
                         ) {
@@ -872,9 +1035,23 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     if (optHeld >= 0 && !tapCancelled &&
                         SystemClock.uptimeMillis() - grabStartTime <= TAP_MAX_MS
                     ) {
-                        handStyle = optHeld   // pinça rápida no cartão: escolhe esse estilo
+                        // Pinça rápida no cartão: escolhe essa opção.
+                        if (settingsTab == 0) {
+                            handStyle = optHeld
+                        } else if (optHeld != menuLayout) {
+                            menuLayout = optHeld
+                            relocateBarForLayout(iw, ih)
+                        }
                     }
                     optHeld = -1
+                }
+                if (grabbed == SET_TAB) {
+                    if (tabHeld >= 0 && !tapCancelled &&
+                        SystemClock.uptimeMillis() - grabStartTime <= TAP_MAX_MS
+                    ) {
+                        settingsTab = tabHeld
+                    }
+                    tabHeld = -1
                 }
                 if (grabbed == PANEL_CONTENT) {
                     emitWebTouch(MotionEvent.ACTION_UP, lastWebPX, lastWebPY)
@@ -923,7 +1100,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                         } else {
                             val halfW = min(barW / 2f / iw, 0.49f)
                             barNX = (cx / iw).coerceIn(halfW, 1f - halfW)
-                            barNY = (cy / ih).coerceIn(0.10f, 0.82f)
+                            barNY = clampBarNY(cy / ih, ih)
                         }
                     }
                     PANEL_HANDLE -> {
@@ -987,6 +1164,60 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         }
         handleState = if (grabbed == HANDLE) 2 else if (handleTouch) 1 else 0
         pHandleState = if (grabbed == PANEL_HANDLE) 2 else if (pHandleTouch) 1 else 0
+
+        updateAnimations()
+    }
+
+    /** Anima os ícones (crescem ao encostar) e a abertura/fechamento suave dos menus. */
+    private fun updateAnimations() {
+        val now = SystemClock.uptimeMillis()
+        val dt = if (animLastMs == 0L) 0.016f else ((now - animLastMs) / 1000f).coerceIn(0.001f, 0.05f)
+        animLastMs = now
+        val kIcon = 1f - exp(-dt * 16f)
+        var moving = false
+
+        for (i in 0 until ICON_COUNT) {
+            val st = iconState[i]
+            val targetScale = if (st == 2) 1.22f else if (st == 1) 1.12f else 1f
+            val targetGlow = if (st == 0) 0f else 1f
+            val targetDot = if (openMenu == i) 1f else 0f
+            iconScale[i] += (targetScale - iconScale[i]) * kIcon
+            iconGlow[i] += (targetGlow - iconGlow[i]) * kIcon
+            iconDot[i] += (targetDot - iconDot[i]) * kIcon
+            if (abs(targetScale - iconScale[i]) > 0.003f || abs(targetGlow - iconGlow[i]) > 0.01f ||
+                abs(targetDot - iconDot[i]) > 0.01f
+            ) {
+                moving = true
+            }
+        }
+
+        // Menu: abre e fecha suavemente. O YouTube (que é uma janela de verdade por cima) abre e fecha na hora.
+        if (openMenu != NONE) {
+            if (openMenu == YOUTUBE_ICON) {
+                shownMenu = openMenu
+                panelAnim = 1f
+            } else {
+                if (shownMenu != openMenu) {
+                    shownMenu = openMenu
+                    panelAnim = min(panelAnim, 0.25f)   // trocar de menu: o novo "salta" de novo
+                }
+                panelAnim += (1f - panelAnim) * (1f - exp(-dt * 14f))
+                if (panelAnim > 0.995f) panelAnim = 1f 
+            }
+        } else if (shownMenu != NONE) {
+            if (shownMenu == YOUTUBE_ICON) {
+                shownMenu = NONE
+                panelAnim = 0f
+            } else {
+                panelAnim += (0f - panelAnim) * (1f - exp(-dt * 16f))
+                if (panelAnim < 0.02f) {
+                    panelAnim = 0f
+                    shownMenu = NONE
+                }
+            }
+        }
+        if (shownMenu != NONE && shownMenu != YOUTUBE_ICON && panelAnim in 0.005f..0.995f) moving = true
+        animating = moving
     }
 
     /** Espalha os blocos pela mesa (eles caem de leve) e volta a câmera para o lado de frente. */
@@ -1485,21 +1716,42 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         canvas.drawPath(arrowPath, fillPaint)
     }
 
-    /** Menu de configurações: título e dois cartões para escolher o estilo da mão. */
+    /** Menu de configurações: título, duas abas (Mão e Menu) e cartões para escolher. */
     private fun drawSettings(canvas: Canvas) {
         val bw = panelW
         textPaint.textAlign = Paint.Align.LEFT
         textPaint.color = Color.WHITE
-        textPaint.textSize = bw * 0.062f
-        canvas.drawText("Configurações", panelLeft + bw * 0.05f, panelTop + panelH * 0.17f, textPaint)
-        textPaint.textSize = bw * 0.045f
-        textPaint.color = Color.argb(210, 255, 255, 255)
-        canvas.drawText("Estilo da mão", panelLeft + bw * 0.05f, panelTop + panelH * 0.34f, textPaint)
+        textPaint.textSize = bw * 0.055f
+        canvas.drawText("Configurações", panelLeft + bw * 0.05f, panelTop + panelH * 0.19f, textPaint)
 
+        // Abas.
+        val tabNames = arrayOf("Mão", "Menu")
+        val tr = tabH / 2f
+        for (t in 0 until 2) {
+            rect.set(tabL[t], tabT, tabL[t] + tabW, tabT + tabH)
+            val on = settingsTab == t
+            fillPaint.color = if (on) Color.argb(150, 67, 160, 71) else Color.argb(90, 120, 120, 120)
+            canvas.drawRoundRect(rect, tr, tr, fillPaint)
+            if (tabTouch[t]) {
+                fillPaint.color = Color.argb(60, 255, 255, 255)
+                canvas.drawRoundRect(rect, tr, tr, fillPaint)
+            }
+            if (grabbed == SET_TAB && tabHeld == t) {
+                canvas.drawRoundRect(rect, tr, tr, pressRingPaint)
+            } else {
+                canvas.drawRoundRect(rect, tr, tr, glassRingPaint)
+            }
+            textPaint.textAlign = Paint.Align.CENTER
+            textPaint.textSize = bw * 0.045f
+            canvas.drawText(tabNames[t], tabL[t] + tabW / 2f, tabT + tabH * 0.70f, textPaint)
+        }
+
+        // Cartões.
         val radius = gap * 1.2f
-        for (o in 0 until STYLE_COUNT) {
+        val names = if (settingsTab == 0) arrayOf("Normal", "Meta Quest", "") else arrayOf("Horizontal", "Arco", "Vertical")
+        for (o in 0 until optCount()) {
             rect.set(optL[o], optT, optL[o] + optW, optT + optH)
-            val selected = handStyle == o
+            val selected = if (settingsTab == 0) handStyle == o else menuLayout == o
             fillPaint.color = if (selected) Color.argb(120, 67, 160, 71) else Color.argb(110, 90, 90, 90)
             canvas.drawRoundRect(rect, radius, radius, fillPaint)
             if (optTouch[o]) {
@@ -1514,39 +1766,65 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 pinchPaint.color = Color.YELLOW
             }
 
-            // Mini desenho de um dedo no estilo.
             val cx = optL[o] + optW / 2f
             val cy = optT + optH * 0.38f
             val sz = optH * 0.22f
-            val x0 = cx - sz
-            val y0 = cy + sz * 0.6f
-            val x1 = cx
-            val y1 = cy - sz * 0.2f
-            val x2 = cx + sz
-            val y2 = cy - sz * 0.8f
-            if (o == STYLE_QUEST) {
-                questPaint.style = Paint.Style.STROKE
-                questPaint.color = QUEST_RIM
-                questPaint.strokeWidth = sz * 0.75f
-                canvas.drawLine(x0, y0, x1, y1, questPaint)
-                canvas.drawLine(x1, y1, x2, y2, questPaint)
-                questPaint.color = QUEST_BODY
-                questPaint.strokeWidth = sz * 0.55f
-                canvas.drawLine(x0, y0, x1, y1, questPaint)
-                canvas.drawLine(x1, y1, x2, y2, questPaint)
+            if (settingsTab == 0) {
+                // Mini desenho de um dedo no estilo.
+                val x0 = cx - sz
+                val y0 = cy + sz * 0.6f
+                val x1 = cx
+                val y1 = cy - sz * 0.2f
+                val x2 = cx + sz
+                val y2 = cy - sz * 0.8f
+                if (o == STYLE_QUEST) {
+                    questPaint.style = Paint.Style.STROKE
+                    questPaint.color = QUEST_RIM
+                    questPaint.strokeWidth = sz * 0.75f
+                    canvas.drawLine(x0, y0, x1, y1, questPaint)
+                    canvas.drawLine(x1, y1, x2, y2, questPaint)
+                    questPaint.color = QUEST_BODY
+                    questPaint.strokeWidth = sz * 0.55f
+                    canvas.drawLine(x0, y0, x1, y1, questPaint)
+                    canvas.drawLine(x1, y1, x2, y2, questPaint)
+                } else {
+                    canvas.drawLine(x0, y0, x1, y1, linePaint)
+                    canvas.drawLine(x1, y1, x2, y2, linePaint)
+                    canvas.drawCircle(x0, y0, sz * 0.16f, pointPaint)
+                    canvas.drawCircle(x1, y1, sz * 0.16f, pointPaint)
+                    canvas.drawCircle(x2, y2, sz * 0.16f, pointPaint)
+                }
             } else {
-                canvas.drawLine(x0, y0, x1, y1, linePaint)
-                canvas.drawLine(x1, y1, x2, y2, linePaint)
-                canvas.drawCircle(x0, y0, sz * 0.16f, pointPaint)
-                canvas.drawCircle(x1, y1, sz * 0.16f, pointPaint)
-                canvas.drawCircle(x2, y2, sz * 0.16f, pointPaint)
+                // Mini desenho da barra: bolinhas em fileira, em arco ou em coluna.
+                val rr = sz * 0.30f
+                fillPaint.color = Color.argb(235, 255, 255, 255)
+                for (k in 0 until 4) {
+                    val t = k - 1.5f
+                    val px: Float
+                    val py: Float
+                    when (o) {
+                        LAYOUT_ARC -> {
+                            px = cx + t * sz * 0.62f
+                            py = cy - sz * 0.45f * (1f - (t * t) / 2.25f) * 1.0f + sz * 0.1f
+                        }
+                        LAYOUT_VERTICAL -> {
+                            px = cx
+                            py = cy + t * sz * 0.58f
+                        }
+                        else -> {
+                            px = cx + t * sz * 0.66f
+                            py = cy
+                        }
+                    }
+                    canvas.drawCircle(px, py, rr, fillPaint)
+                }
             }
 
-            // Nome do estilo.
+            // Nome.
             textPaint.textAlign = Paint.Align.CENTER
             textPaint.color = Color.WHITE
-            textPaint.textSize = bw * 0.05f
-            canvas.drawText(if (o == STYLE_QUEST) "Meta Quest" else "Normal", cx, optT + optH * 0.88f, textPaint)
+            textPaint.textSize = bw * 0.045f
+            canvas.drawText(names[o], cx, optT + optH * 0.90f, textPaint)
         }
         textPaint.color = Color.WHITE
     }
@@ -1662,27 +1940,66 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         canvas.drawRoundRect(rect, h / 2f, h / 2f, fillPaint)
     }
 
+    private fun withAlpha(c: Int, a: Int): Int = Color.argb(a, Color.red(c), Color.green(c), Color.blue(c))
+
+    /** Barra de vidro: um comprimido (horizontal ou vertical) ou uma faixa curva (em arco). */
     private fun drawBar(canvas: Canvas) {
-        // Fundo da barra (escuro e meio transparente).
-        fillPaint.color = Color.argb(130, 30, 30, 30)
-        rect.set(barLeft, barTop, barLeft + barW, barTop + barH)
-        val r = gap * 1.6f
-        canvas.drawRoundRect(rect, r, r, fillPaint)
+        if (menuLayout == LAYOUT_ARC) {
+            val w = iconS + 2f * gap * 0.8f
+            rect.set(arcCX - arcR, arcCY - arcR, arcCX + arcR, arcCY + arcR)
+            val start = -90f - ARC_SPREAD
+            val sweep = 2f * ARC_SPREAD
+            bandPaint.strokeWidth = w + 5f
+            bandPaint.color = Color.argb(95, 255, 255, 255)
+            canvas.drawArc(rect, start, sweep, false, bandPaint)      // borda clara
+            bandPaint.strokeWidth = w
+            bandPaint.color = Color.argb(115, 18, 22, 32)
+            canvas.drawArc(rect, start, sweep, false, bandPaint)      // vidro escuro
+            bandPaint.strokeWidth = w * 0.42f
+            bandPaint.color = Color.argb(22, 255, 255, 255)
+            val inner = arcR + w * 0.18f
+            rect.set(arcCX - inner, arcCY - inner, arcCX + inner, arcCY + inner)
+            canvas.drawArc(rect, start, sweep, false, bandPaint)      // reflexo
+        } else {
+            val r = min(barW, barH) / 2f
+            rect.set(barLeft, barTop, barLeft + barW, barTop + barH)
+            fillPaint.color = Color.argb(115, 18, 22, 32)
+            canvas.drawRoundRect(rect, r, r, fillPaint)
+            // Reflexo na metade de cima.
+            if (menuLayout == LAYOUT_VERTICAL) {
+                rect.set(barLeft + barW * 0.10f, barTop + gap, barLeft + barW * 0.50f, barTop + barH - gap)
+            } else {
+                rect.set(barLeft + gap, barTop + barH * 0.10f, barLeft + barW - gap, barTop + barH * 0.46f)
+            }
+            fillPaint.color = Color.argb(24, 255, 255, 255)
+            canvas.drawRoundRect(rect, r * 0.6f, r * 0.6f, fillPaint)
+            rect.set(barLeft, barTop, barLeft + barW, barTop + barH)
+            canvas.drawRoundRect(rect, r, r, glassRingPaint)
+        }
 
         // Barrinha branca embaixo: serve para mover a barra.
         drawHandle(canvas, handleCX, handleCY, handleW, handleState)
-
-        // Bolinha branca embaixo do ícone que está com o menu aberto.
-        if (openMenu != NONE) {
-            fillPaint.color = Color.WHITE
-            canvas.drawCircle(iconCX[openMenu], barTop + barH - gap * 0.5f, gap * 0.28f, fillPaint)
-        }
     }
 
-    /** Menu vazio do ícone que foi tocado (por enquanto só a janela, sem nada dentro). */
+    /** Menu aberto: janela de vidro que abre e fecha suavemente (cresce e aparece aos poucos). */
     private fun drawPanel(canvas: Canvas) {
-        val m = openMenu
+        val m = shownMenu
         if (m == NONE) return
+        val animated = m != YOUTUBE_ICON && panelAnim < 0.999f
+        if (animated) {
+            val pad = gap * 3f
+            canvas.saveLayerAlpha(
+                panelLeft - pad, panelTop - pad, panelLeft + panelW + pad, panelTop + panelH + pad + gap * 3f,
+                (255f * panelAnim).toInt().coerceIn(0, 255)
+            )
+            val sc = 0.88f + 0.12f * panelAnim
+            val cx = panelLeft + panelW / 2f
+            val cy = panelTop + panelH / 2f
+            canvas.translate(cx, cy)
+            canvas.scale(sc, sc)
+            canvas.translate(-cx, -cy)
+        }
+
         rect.set(panelLeft, panelTop, panelLeft + panelW, panelTop + panelH)
         val r = gap * 1.6f
         if (isVrWeb()) {
@@ -1695,43 +2012,141 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 canvas.drawRect(rect, fillPaint)
             }
         } else if (!isWebPanel()) {
-            fillPaint.color = Color.argb(150, 20, 20, 20)
+            fillPaint.color = Color.argb(150, 18, 22, 32)
             canvas.drawRoundRect(rect, r, r, fillPaint)
         }
         // Borda com a cor do ícone que abriu o menu.
         panelBorderPaint.color = iconColors[m]
         canvas.drawRoundRect(rect, r, r, panelBorderPaint)
 
-        if (isGameOpen()) drawGame(canvas)
-        if (isSettingsOpen()) drawSettings(canvas)
+        if (m == GAME_ICON) drawGame(canvas)
+        if (m == SETTINGS_ICON) drawSettings(canvas)
 
         // Barrinha branca embaixo do menu: serve para mover só este menu.
         drawHandle(canvas, pHandleCX, pHandleCY, pHandleW, pHandleState)
+
+        if (animated) canvas.restore()
     }
 
+    // ---------- desenhos dos ícones (tudo feito com formas simples, em branco) ----------
+
+    private fun glyphGear(canvas: Canvas, cx: Float, cy: Float, r: Float, hole: Int) {
+        val outer = r * 0.54f
+        val inner = outer * 0.76f
+        glyphPath.reset()
+        for (k in 0 until 8) {
+            val a = k * (TWO_PI_F / 8f)
+            val a0 = a - 0.30f
+            val a1 = a - 0.16f
+            val a2 = a + 0.16f
+            val a3 = a + 0.30f
+            if (k == 0) glyphPath.moveTo(cx + inner * cos(a0), cy + inner * sin(a0)) else glyphPath.lineTo(cx + inner * cos(a0), cy + inner * sin(a0))
+            glyphPath.lineTo(cx + outer * cos(a1), cy + outer * sin(a1))
+            glyphPath.lineTo(cx + outer * cos(a2), cy + outer * sin(a2))
+            glyphPath.lineTo(cx + inner * cos(a3), cy + inner * sin(a3))
+        }
+        glyphPath.close()
+        fillPaint.color = Color.WHITE
+        canvas.drawPath(glyphPath, fillPaint)
+        fillPaint.color = hole
+        canvas.drawCircle(cx, cy, outer * 0.36f, fillPaint)
+    }
+
+    private fun glyphPlay(canvas: Canvas, cx: Float, cy: Float, r: Float, hole: Int) {
+        val w = r * 0.58f
+        val h = w * 0.72f
+        rect.set(cx - w, cy - h, cx + w, cy + h)
+        fillPaint.color = Color.WHITE
+        canvas.drawRoundRect(rect, w * 0.38f, w * 0.38f, fillPaint)
+        glyphPath.reset()
+        glyphPath.moveTo(cx - w * 0.22f, cy - h * 0.52f)
+        glyphPath.lineTo(cx - w * 0.22f, cy + h * 0.52f)
+        glyphPath.lineTo(cx + w * 0.44f, cy)
+        glyphPath.close()
+        fillPaint.color = hole
+        canvas.drawPath(glyphPath, fillPaint)
+    }
+
+    private fun glyphGrid(canvas: Canvas, cx: Float, cy: Float, r: Float) {
+        val sq = r * 0.30f
+        val g = r * 0.07f
+        fillPaint.color = Color.WHITE
+        for (a in 0..1) {
+            for (b in 0..1) {
+                val x = cx + (if (a == 0) -g - sq else g)
+                val y = cy + (if (b == 0) -g - sq else g)
+                rect.set(x, y, x + sq, y + sq)
+                canvas.drawRoundRect(rect, sq * 0.28f, sq * 0.28f, fillPaint)
+            }
+        }
+    }
+
+    private fun glyphCube(canvas: Canvas, cx: Float, cy: Float, r: Float) {
+        val c = r * 0.52f
+        val dx = c * 0.866f
+        // Topo.
+        glyphPath.reset()
+        glyphPath.moveTo(cx, cy - c)
+        glyphPath.lineTo(cx + dx, cy - c * 0.5f)
+        glyphPath.lineTo(cx, cy)
+        glyphPath.lineTo(cx - dx, cy - c * 0.5f)
+        glyphPath.close()
+        fillPaint.color = Color.WHITE
+        canvas.drawPath(glyphPath, fillPaint)
+        // Lado esquerdo.
+        glyphPath.reset()
+        glyphPath.moveTo(cx - dx, cy - c * 0.5f)
+        glyphPath.lineTo(cx, cy)
+        glyphPath.lineTo(cx, cy + c)
+        glyphPath.lineTo(cx - dx, cy + c * 0.5f)
+        glyphPath.close()
+        fillPaint.color = Color.argb(215, 255, 255, 255)
+        canvas.drawPath(glyphPath, fillPaint)
+        // Lado direito.
+        glyphPath.reset()
+        glyphPath.moveTo(cx, cy)
+        glyphPath.lineTo(cx + dx, cy - c * 0.5f)
+        glyphPath.lineTo(cx + dx, cy + c * 0.5f)
+        glyphPath.lineTo(cx, cy + c)
+        glyphPath.close()
+        fillPaint.color = Color.argb(160, 255, 255, 255)
+        canvas.drawPath(glyphPath, fillPaint)
+    }
+
+    /** Ícone de vidro: botão redondo colorido com brilho, anel claro e um desenho branco. */
     private fun drawIcon(canvas: Canvas, i: Int) {
         val state = iconState[i]
-        val grow = when (state) {
-            2 -> 1.2f
-            1 -> 1.1f
-            else -> 1f
-        }
-        val half = iconS / 2f * grow
+        val half = iconS / 2f * iconScale[i]
         val cx = iconCX[i]
         val cy = iconCY[i]
-        val radius = half * 0.5f
 
-        rect.set(cx - half, cy - half, cx + half, cy + half)
-        fillPaint.color = iconColors[i]
-        canvas.drawRoundRect(rect, radius, radius, fillPaint)
-        canvas.drawRoundRect(rect, radius, radius, outlinePaint)
+        // Brilho em volta quando o dedo encosta ou segura.
+        if (iconGlow[i] > 0.01f) {
+            fillPaint.color = Color.argb((80f * iconGlow[i]).toInt(), 255, 255, 255)
+            canvas.drawCircle(cx, cy, half * 1.30f, fillPaint)
+        }
+        // Botão.
+        fillPaint.color = withAlpha(iconColors[i], 205)
+        canvas.drawCircle(cx, cy, half, fillPaint)
+        fillPaint.color = Color.argb(48, 255, 255, 255)
+        canvas.drawCircle(cx, cy - half * 0.26f, half * 0.74f, fillPaint)   // reflexo de cima
+        canvas.drawCircle(cx, cy, half, glassRingPaint)
 
-        if (state == 1) {
-            // Acende quando o dedo encosta.
-            fillPaint.color = Color.argb(70, 255, 255, 255)
-            canvas.drawRoundRect(rect, radius, radius, fillPaint)
-        } else if (state == 2) {
-            canvas.drawRoundRect(rect, radius, radius, pressRingPaint)
+        // Desenho.
+        val hole = shade(iconColors[i], 0.78f)
+        when (i) {
+            SETTINGS_ICON -> glyphGear(canvas, cx, cy, half, hole)
+            YOUTUBE_ICON -> glyphPlay(canvas, cx, cy, half, hole)
+            GAME_ICON -> glyphCube(canvas, cx, cy, half)
+            else -> glyphGrid(canvas, cx, cy, half)
+        }
+
+        if (state == 2) canvas.drawCircle(cx, cy, half * 1.06f, pressRingPaint)
+
+        // Bolinha branca embaixo do ícone que está com o menu aberto.
+        if (iconDot[i] > 0.02f) {
+            fillPaint.color = Color.WHITE
+            canvas.drawCircle(cx, cy + iconS / 2f + gap * 0.45f, gap * 0.28f * iconDot[i], fillPaint)
         }
     }
 
@@ -1758,6 +2173,14 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val SETTINGS_ICON = 0  // o ícone verde abre as configurações
         const val GAME_ICON = 3      // o ícone amarelo abre o jogo de empilhar blocos
 
+        // Formatos da barra.
+        const val LAYOUT_HORIZONTAL = 0
+        const val LAYOUT_ARC = 1
+        const val LAYOUT_VERTICAL = 2
+        const val LAYOUT_COUNT = 3
+        const val OPT_MAX = 3         // maior número de cartões de escolha numa aba
+        const val ARC_SPREAD = 50f    // barra em arco: abertura de cada lado, em graus
+
         // Estilos da mão.
         const val STYLE_NORMAL = 0
         const val STYLE_QUEST = 1
@@ -1773,7 +2196,8 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val GAME_BLOCK = ICON_COUNT + 3    // pinça segurando um bloco do jogo
         const val GAME_RESET = ICON_COUNT + 4    // pinça no botão de reiniciar o jogo
         const val GAME_ORBIT = ICON_COUNT + 6    // pinça na mesa do jogo (arrastar gira a mesa)
-        const val SET_OPT = ICON_COUNT + 5       // pinça num cartão de estilo da mão
+        const val SET_OPT = ICON_COUNT + 5       // pinça num cartão de escolha das configurações
+        const val SET_TAB = ICON_COUNT + 7       // pinça numa aba das configurações
 
         // Jogo 3D de empilhar blocos (a mesa tem 1,0 de lado).
         const val GAME_BLOCKS = 5
