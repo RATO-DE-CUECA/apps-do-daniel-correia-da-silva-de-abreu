@@ -234,9 +234,13 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     private var optHeld = -1
     // ---- App "Jogos": abre jogos (APK) que já estão instalados no celular ----
     private val appCtx: Context = context
-    private val appGameNames = arrayOf("Gorilla MR")                          // nome mostrado
-    private val appGameKeys = arrayOf(arrayOf("gorilla mr", "gorillamr", "gorilla_mr", "gorilla-mr"))   // jeitos de o nome aparecer no celular
-    private val appGameIntent = arrayOfNulls<Intent>(1)                       // como abrir (null = não instalado)
+    private val appGameNames = arrayOf("Blocos", "Gorilla MR")                // nome mostrado
+    private val appGameBuiltIn = booleanArrayOf(true, false)                  // true = jogo do próprio app (abre aqui dentro)
+    private val appGameKeys = arrayOf(                                        // jeitos de o nome aparecer no celular
+        emptyArray<String>(),
+        arrayOf("gorilla mr", "gorillamr", "gorilla_mr", "gorilla-mr")
+    )
+    private val appGameIntent = arrayOfNulls<Intent>(appGameNames.size)       // como abrir (null = não instalado)
     private val tileL = FloatArray(3)
     private var tileT = 0f
     private var tileW = 0f
@@ -624,14 +628,14 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         iconS = u * 0.13f
         gap = iconS * 0.25f
         if (menuLayout == LAYOUT_GRID) {
-            val rows = (ICON_COUNT + 1) / 2
+            val rows = (ICON_SHOWN + 1) / 2
             barW = 2f * (iconS + gap * 2f) + 2f * gap * 1.3f
             barH = iconS * 0.45f + gap * 0.6f + rows * (iconS + iconS * 0.34f + gap * 0.8f) + gap
         } else if (menuLayout == LAYOUT_VERTICAL) {
             barW = iconS + 2f * gap
-            barH = ICON_COUNT * iconS + (ICON_COUNT + 1) * gap
+            barH = ICON_SHOWN * iconS + (ICON_SHOWN + 1) * gap
         } else {
-            barW = ICON_COUNT * iconS + (ICON_COUNT + 1) * gap
+            barW = ICON_SHOWN * iconS + (ICON_SHOWN + 1) * gap
             barH = iconS + 2f * gap
         }
         if (worldActive) {
@@ -655,13 +659,13 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 val cellW = iconS + gap * 2f
                 val cellH = iconS + iconS * 0.34f + gap * 0.8f
                 val padTop = iconS * 0.45f + gap * 0.6f
-                for (i in 0 until ICON_COUNT) {
+                for (i in 0 until ICON_SHOWN) {
                     iconCX[i] = barLeft + gap * 1.3f + cellW * ((i % 2) + 0.5f)
                     iconCY[i] = barTop + padTop + cellH * (i / 2) + iconS / 2f + gap * 0.1f
                 }
             }
             LAYOUT_VERTICAL -> {
-                for (i in 0 until ICON_COUNT) {
+                for (i in 0 until ICON_SHOWN) {
                     iconCX[i] = barCX
                     iconCY[i] = barTop + gap + iconS / 2f + i * (iconS + gap)
                 }
@@ -671,17 +675,17 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 arcR = iconS * 2.4f
                 val spread = ARC_SPREAD * PI_F / 180f
                 var cosSum = 0f
-                for (i in 0 until ICON_COUNT) {
-                    val a = -spread + i * (2f * spread / (ICON_COUNT - 1))
+                for (i in 0 until ICON_SHOWN) {
+                    val a = -spread + i * (2f * spread / (ICON_SHOWN - 1))
                     cosSum += cos(a)
                 }
-                val cbar = cosSum / ICON_COUNT
+                val cbar = cosSum / ICON_SHOWN
                 var minX = Float.MAX_VALUE
                 var maxX = -Float.MAX_VALUE
                 var minY = Float.MAX_VALUE
                 var maxY = -Float.MAX_VALUE
-                for (i in 0 until ICON_COUNT) {
-                    val a = -spread + i * (2f * spread / (ICON_COUNT - 1))
+                for (i in 0 until ICON_SHOWN) {
+                    val a = -spread + i * (2f * spread / (ICON_SHOWN - 1))
                     iconCX[i] = barCX + arcR * sin(a)
                     iconCY[i] = barCY - arcR * (cos(a) - cbar)
                     minX = min(minX, iconCX[i])
@@ -697,7 +701,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 barH = maxY - minY + iconS + 2f * gap
             }
             else -> {
-                for (i in 0 until ICON_COUNT) {
+                for (i in 0 until ICON_SHOWN) {
                     iconCX[i] = barLeft + gap + iconS / 2f + i * (iconS + gap)
                     iconCY[i] = barCY
                 }
@@ -833,6 +837,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             val apps = pm.queryIntentActivities(main, 0)
             for (g in appGameNames.indices) {
                 appGameIntent[g] = null
+                if (appGameBuiltIn[g]) continue
                 search@ for (key in appGameKeys[g]) {
                     for (ri in apps) {
                         val pkg = ri.activityInfo.packageName
@@ -852,8 +857,15 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         }
     }
 
-    /** Abre o jogo instalado (ele toma a tela; para voltar ao AETHER MR use o botão voltar/início do celular). */
-    private fun launchGame(g: Int) {
+    /**
+     * Abre o jogo. Os do próprio app (Blocos) abrem aqui dentro; os instalados no celular tomam a tela
+     * (para voltar ao AETHER MR use o botão voltar/início do celular).
+     */
+    private fun launchGame(g: Int, iw: Float, ih: Float) {
+        if (appGameBuiltIn[g]) {
+            toggleMenu(GAME_ICON, iw, ih)
+            return
+        }
         val intent = appGameIntent[g] ?: return
         try {
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -969,7 +981,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         }
         applyGeometry(iw, ih)
 
-        for (i in 0 until ICON_COUNT) iconTouch[i] = false
+        for (i in 0 until ICON_SHOWN) iconTouch[i] = false
         for (b in 0 until GAME_BLOCKS) gTouch[b] = false
         for (o in 0 until OPT_MAX) optTouch[o] = false
         tabTouch[0] = false
@@ -993,7 +1005,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 // Dedo indicador encostando?
                 val fx = hand[INDEX_TIP].x() * iw
                 val fy = hand[INDEX_TIP].y() * ih
-                for (i in 0 until ICON_COUNT) {
+                for (i in 0 until ICON_SHOWN) {
                     if (abs(fx - iconCX[i]) <= iconS * 0.55f && abs(fy - iconCY[i]) <= iconS * 0.55f) {
                         iconTouch[i] = true
                     }
@@ -1087,7 +1099,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             for (p in 0 until pinchCount) {
                 val px = pinchX[p]
                 val py = pinchY[p]
-                for (i in 0 until ICON_COUNT) {
+                for (i in 0 until ICON_SHOWN) {
                     if (abs(px - iconCX[i]) <= reach && abs(py - iconCY[i]) <= reach) {
                         val d = hypot(px - iconCX[i], py - iconCY[i])
                         if (d < bestDist) { best = i; bestDist = d; bestIdx = p }
@@ -1268,7 +1280,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         } else {
             if (pinchCount == 0) {
                 // Soltou. Pinça rápida num ícone, sem a mão se afastar = toque: abre/fecha o menu.
-                if (grabbed in 0 until ICON_COUNT && !tapCancelled &&
+                if (grabbed in 0 until ICON_SHOWN && !tapCancelled &&
                     SystemClock.uptimeMillis() - grabStartTime <= TAP_MAX_MS
                 ) {
                     toggleMenu(if (openMenu == grabbed) NONE else grabbed, iw, ih)
@@ -1318,7 +1330,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     if (tileHeld >= 0 && !tapCancelled &&
                         SystemClock.uptimeMillis() - grabStartTime <= TAP_MAX_MS
                     ) {
-                        launchGame(tileHeld)   // pinça rápida: abre o jogo
+                        launchGame(tileHeld, iw, ih)   // pinça rápida: abre o jogo
                     }
                     tileHeld = -1
                 }
@@ -1428,7 +1440,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             gameLastMs = 0L
         }
 
-        for (i in 0 until ICON_COUNT) {
+        for (i in 0 until ICON_SHOWN) {
             iconState[i] = if (grabbed == i) 2 else if (iconTouch[i]) 1 else 0
         }
         handleState = if (grabbed == HANDLE) 2 else if (handleTouch) 1 else 0
@@ -1445,11 +1457,11 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         val kIcon = 1f - exp(-dt * 16f)
         var moving = false
 
-        for (i in 0 until ICON_COUNT) {
+        for (i in 0 until ICON_SHOWN) {
             val st = iconState[i]
             val targetScale = if (st == 2) 1.22f else if (st == 1) 1.12f else 1f
             val targetGlow = if (st == 0) 0f else 1f
-            val targetDot = if (openMenu == i) 1f else 0f
+            val targetDot = if (openMenu == i || (i == GAMES_ICON && openMenu == GAME_ICON)) 1f else 0f
             iconScale[i] += (targetScale - iconScale[i]) * kIcon
             iconGlow[i] += (targetGlow - iconGlow[i]) * kIcon
             iconDot[i] += (targetDot - iconDot[i]) * kIcon
@@ -2013,7 +2025,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         canvas.drawText("Jogos", panelLeft + bw * 0.05f, panelTop + panelH * 0.20f, thinPaint)
         val radius = gap * 1.2f
         for (g in appGameNames.indices) {
-            val ok = appGameIntent[g] != null
+            val ok = appGameBuiltIn[g] || appGameIntent[g] != null
             rect.set(tileL[g], tileT, tileL[g] + tileW, tileT + tileH)
             fillPaint.color = if (ok) Color.argb(120, 80, 110, 160) else Color.argb(80, 110, 116, 130)
             canvas.drawRoundRect(rect, radius, radius, fillPaint)
@@ -2027,13 +2039,18 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 canvas.drawRoundRect(rect, radius, radius, glassRingPaint)
             }
             val cx = tileL[g] + tileW / 2f
-            glyphPad(canvas, cx, tileT + tileH * 0.36f, tileH * 0.34f, Color.rgb(66, 88, 130))
+            if (appGameBuiltIn[g]) {
+                glyphCube(canvas, cx, tileT + tileH * 0.36f, tileH * 0.34f)
+            } else {
+                glyphPad(canvas, cx, tileT + tileH * 0.36f, tileH * 0.34f, Color.rgb(66, 88, 130))
+            }
             thinPaint.textAlign = Paint.Align.CENTER
             thinPaint.textSize = bw * 0.046f
             canvas.drawText(appGameNames[g], cx, tileT + tileH * 0.76f, thinPaint)
             thinPaint.textSize = bw * 0.034f
             thinPaint.color = Color.argb(200, 255, 255, 255)
-            canvas.drawText(if (ok) "Toque para abrir" else "Não instalado", cx, tileT + tileH * 0.92f, thinPaint)
+            val status = if (appGameBuiltIn[g]) "Toque para jogar" else if (ok) "Toque para abrir" else "Não instalado"
+            canvas.drawText(status, cx, tileT + tileH * 0.92f, thinPaint)
             thinPaint.color = Color.WHITE
         }
     }
@@ -2188,7 +2205,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             drawPanel(canvas)
             val homeTilt = menuLayout == LAYOUT_GRID && beginTilt(canvas, barLeft, barTop, barLeft + barW, barTop + barH)
             drawBar(canvas)
-            for (i in 0 until ICON_COUNT) drawIcon(canvas, i)
+            for (i in 0 until ICON_SHOWN) drawIcon(canvas, i)
             if (homeTilt) canvas.restore()
             drawPopover(canvas)
             // Anel amarelo no ponto onde a pinça está fechada.
@@ -2670,6 +2687,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val OFFSCREEN = 100000f      // "bem longe da tela"
 
         const val ICON_COUNT = 4
+        const val ICON_SHOWN = 3     // ícones que aparecem na janela (o jogo de blocos abre pela lista de Jogos)
         const val YOUTUBE_ICON = 1   // o ícone vermelho abre o YouTube
         const val SETTINGS_ICON = 0  // o ícone verde abre as configurações
         const val GAMES_ICON = 2     // o ícone azul abre a lista de jogos instalados
