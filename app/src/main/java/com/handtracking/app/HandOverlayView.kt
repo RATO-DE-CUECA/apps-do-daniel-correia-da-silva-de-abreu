@@ -1,6 +1,7 @@
 package com.handtracking.app
 
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -43,6 +44,8 @@ import kotlin.math.sqrt
  *    (pinça rápida = clique, pinça e arrastar = rolar).
  *  - Menu verde: configurações, em duas abas. "Mão": estilo da mão (normal ou Meta Quest).
  *    "Menu": formato da barra (horizontal, em arco ou vertical). As escolhas ficam salvas no aparelho.
+ *  - Menu azul ("Jogos"): abre jogos instalados no celular (APK), como o Gorilla MR. O app acha o jogo pelo
+ *    nome na lista de apps do celular, então não precisa copiar nada do jogo para dentro deste app.
  *  - Menu amarelo: mini jogo 3D de empilhar blocos numa mesa. Pinça num bloco: ele sobe e você leva
  *    até onde quer (a marca amarela na mesa mostra onde ele vai cair); solta para cair. Para ver a mesa
  *    de outros lados: vire a cabeça (a mesa "gira" junto) ou faça pinça na mesa e arraste. O botão
@@ -229,6 +232,18 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     private var optH = 0f
     private val optTouch = BooleanArray(OPT_MAX)
     private var optHeld = -1
+    // ---- App "Jogos": abre jogos (APK) que já estão instalados no celular ----
+    private val appCtx: Context = context
+    private val appGameNames = arrayOf("Gorilla MR")                          // nome mostrado
+    private val appGameKeys = arrayOf(arrayOf("gorilla mr", "gorillamr", "gorilla_mr", "gorilla-mr"))   // jeitos de o nome aparecer no celular
+    private val appGameIntent = arrayOfNulls<Intent>(1)                       // como abrir (null = não instalado)
+    private val tileL = FloatArray(3)
+    private var tileT = 0f
+    private var tileW = 0f
+    private var tileH = 0f
+    private val tileTouch = BooleanArray(3)
+    private var tileHeld = -1
+
     // ---- Janelas de vidro: ••• em cima, bolinha e barrinha embaixo, inclinação e vidro fosco ----
     private var imgW = 0f                           // tamanho da imagem da câmera (para inclinar e desfocar)
     private var imgH = 0f
@@ -793,12 +808,57 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             tabL[1] = panelLeft + panelW - pad - tabW
             tabL[0] = tabL[1] - tabW - pad * 0.5f
         }
+        if (openMenu == GAMES_ICON) {
+            val tpad = panelW * 0.05f
+            val tcnt = appGameNames.size
+            tileW = min((panelW - tpad * (tcnt + 1)) / tcnt, panelW * 0.42f)
+            tileH = panelH * 0.60f
+            tileT = panelTop + panelH * 0.32f
+            for (g in 0 until tcnt) tileL[g] = panelLeft + tpad + g * (tileW + tpad)
+        }
         if (popFor >= 0) {
             popW = iconS * 2.3f
             popRowH = iconS * 0.5f
             val pl = pillCX[popFor] - popW / 2f
             popL = if (worldActive) pl else pl.coerceIn(margin, max(margin, iw - margin - popW))
             popT = pillCY[popFor] + pillH / 2f + gap * 0.4f
+        }
+    }
+
+    /** Procura, entre os apps instalados, os jogos da lista (pelo nome que aparece no celular). */
+    private fun scanGames() {
+        try {
+            val pm = appCtx.packageManager
+            val main = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+            val apps = pm.queryIntentActivities(main, 0)
+            for (g in appGameNames.indices) {
+                appGameIntent[g] = null
+                search@ for (key in appGameKeys[g]) {
+                    for (ri in apps) {
+                        val pkg = ri.activityInfo.packageName
+                        if (pkg == appCtx.packageName) continue
+                        if (ri.loadLabel(pm).toString().contains(key, ignoreCase = true)) {
+                            val found = pm.getLaunchIntentForPackage(pkg)
+                            if (found != null) {
+                                appGameIntent[g] = found
+                                break@search
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            for (g in appGameNames.indices) appGameIntent[g] = null
+        }
+    }
+
+    /** Abre o jogo instalado (ele toma a tela; para voltar ao AETHER MR use o botão voltar/início do celular). */
+    private fun launchGame(g: Int) {
+        val intent = appGameIntent[g] ?: return
+        try {
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            appCtx.startActivity(intent)
+        } catch (e: Exception) {
         }
     }
 
@@ -809,6 +869,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         popFor = -1
         if (prevMenu == GAME_ICON && openMenu != GAME_ICON) anchorsPending = true   // a barra volta para a sua frente
         if (openMenu == GAME_ICON) headRefReady = false                             // olhar daqui é o lado "de frente"
+        if (openMenu == GAMES_ICON) scanGames()                                     // vê de novo o que está instalado
         if (openMenu == GAME_ICON && !panelMoved[GAME_ICON]) lowerBarForGame(iw, ih)
     }
 
@@ -913,6 +974,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         for (o in 0 until OPT_MAX) optTouch[o] = false
         tabTouch[0] = false
         tabTouch[1] = false
+        for (g in 0 until 3) tileTouch[g] = false
         pillTouch[0] = false
         pillTouch[1] = false
         popTouch[0] = false
@@ -950,6 +1012,11 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                             val ty0 = popT + it * popRowH
                             if (fx >= popL && fx <= popL + popW && fy >= ty0 && fy <= ty0 + popRowH) popTouch[it] = true
                         }
+                    }
+                }
+                if (openMenu == GAMES_ICON) {
+                    for (g in appGameNames.indices) {
+                        if (fx >= tileL[g] && fx <= tileL[g] + tileW && fy >= tileT && fy <= tileT + tileH) tileTouch[g] = true
                     }
                 }
                 if (isSettingsOpen()) {
@@ -991,6 +1058,10 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         ) {
             grabbed = NONE
             gameHeld = -1
+        }
+        if (grabbed == APP_TILE && (openMenu != GAMES_ICON || tileHeld < 0)) {
+            grabbed = NONE
+            tileHeld = -1
         }
         if (((grabbed == PILL || grabbed == DOT || grabbed == POP) && menuLayout != LAYOUT_GRID) ||
             (grabbed == DOT && openMenu == NONE) || (grabbed == POP && popFor < 0)
@@ -1092,6 +1163,23 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                             best = SET_OPT
                             bestIdx = p
                             optHeld = o
+                            break
+                        }
+                    }
+                    if (best != NONE) break
+                }
+            }
+            if (best == NONE && openMenu == GAMES_ICON) {
+                // Pinça num jogo da lista.
+                val tol = iconS * 0.1f
+                for (p in 0 until pinchCount) {
+                    for (g in appGameNames.indices) {
+                        if (pinchX[p] >= tileL[g] - tol && pinchX[p] <= tileL[g] + tileW + tol &&
+                            pinchY[p] >= tileT - tol && pinchY[p] <= tileT + tileH + tol
+                        ) {
+                            best = APP_TILE
+                            bestIdx = p
+                            tileHeld = g
                             break
                         }
                     }
@@ -1225,6 +1313,14 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                         settingsTab = tabHeld
                     }
                     tabHeld = -1
+                }
+                if (grabbed == APP_TILE) {
+                    if (tileHeld >= 0 && !tapCancelled &&
+                        SystemClock.uptimeMillis() - grabStartTime <= TAP_MAX_MS
+                    ) {
+                        launchGame(tileHeld)   // pinça rápida: abre o jogo
+                    }
+                    tileHeld = -1
                 }
                 if (grabbed == PANEL_CONTENT) {
                     emitWebTouch(MotionEvent.ACTION_UP, lastWebPX, lastWebPY)
@@ -1890,6 +1986,58 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         canvas.drawPath(arrowPath, fillPaint)
     }
 
+    /** Controle de videogame (ícone de Jogos). */
+    private fun glyphPad(canvas: Canvas, cx: Float, cy: Float, r: Float, hole: Int) {
+        val w = r * 0.66f
+        val h = r * 0.40f
+        fillPaint.color = Color.WHITE
+        rect.set(cx - w, cy - h, cx + w, cy + h)
+        canvas.drawRoundRect(rect, h * 0.9f, h * 0.9f, fillPaint)
+        fillPaint.color = hole
+        val a = h * 0.16f
+        val l = h * 0.52f
+        val px = cx - w * 0.50f
+        rect.set(px - l, cy - a, px + l, cy + a)
+        canvas.drawRect(rect, fillPaint)
+        rect.set(px - a, cy - l, px + a, cy + l)
+        canvas.drawRect(rect, fillPaint)
+        canvas.drawCircle(cx + w * 0.36f, cy - h * 0.24f, h * 0.20f, fillPaint)
+        canvas.drawCircle(cx + w * 0.62f, cy + h * 0.20f, h * 0.20f, fillPaint)
+    }
+
+    /** Janela "Jogos": um cartão para cada jogo instalado (ou aviso de que não está instalado). */
+    private fun drawGamesPanel(canvas: Canvas) {
+        val bw = panelW
+        thinPaint.textAlign = Paint.Align.LEFT
+        thinPaint.textSize = bw * 0.062f
+        canvas.drawText("Jogos", panelLeft + bw * 0.05f, panelTop + panelH * 0.20f, thinPaint)
+        val radius = gap * 1.2f
+        for (g in appGameNames.indices) {
+            val ok = appGameIntent[g] != null
+            rect.set(tileL[g], tileT, tileL[g] + tileW, tileT + tileH)
+            fillPaint.color = if (ok) Color.argb(120, 80, 110, 160) else Color.argb(80, 110, 116, 130)
+            canvas.drawRoundRect(rect, radius, radius, fillPaint)
+            if (tileTouch[g]) {
+                fillPaint.color = Color.argb(60, 255, 255, 255)
+                canvas.drawRoundRect(rect, radius, radius, fillPaint)
+            }
+            if (grabbed == APP_TILE && tileHeld == g) {
+                canvas.drawRoundRect(rect, radius, radius, pressRingPaint)
+            } else {
+                canvas.drawRoundRect(rect, radius, radius, glassRingPaint)
+            }
+            val cx = tileL[g] + tileW / 2f
+            glyphPad(canvas, cx, tileT + tileH * 0.36f, tileH * 0.34f, Color.rgb(66, 88, 130))
+            thinPaint.textAlign = Paint.Align.CENTER
+            thinPaint.textSize = bw * 0.046f
+            canvas.drawText(appGameNames[g], cx, tileT + tileH * 0.76f, thinPaint)
+            thinPaint.textSize = bw * 0.034f
+            thinPaint.color = Color.argb(200, 255, 255, 255)
+            canvas.drawText(if (ok) "Toque para abrir" else "Não instalado", cx, tileT + tileH * 0.92f, thinPaint)
+            thinPaint.color = Color.WHITE
+        }
+    }
+
     /** Menu de configurações: título, duas abas (Mão e Menu) e cartões para escolher. */
     private fun drawSettings(canvas: Canvas) {
         val bw = panelW
@@ -2330,6 +2478,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
         if (m == GAME_ICON) drawGame(canvas)
         if (m == SETTINGS_ICON) drawSettings(canvas)
+        if (m == GAMES_ICON) drawGamesPanel(canvas)
 
         if (menuLayout == LAYOUT_GRID) {
             drawPill(canvas, 1)
@@ -2427,7 +2576,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         canvas.drawPath(glyphPath, fillPaint)
     }
 
-    private val appNames = arrayOf("Ajustes", "YouTube", "Em breve", "Blocos")
+    private val appNames = arrayOf("Ajustes", "YouTube", "Jogos", "Blocos")
 
     /** Ícone de vidro: botão colorido com brilho, anel claro e um desenho branco (e o nome, na janela). */
     private fun drawIcon(canvas: Canvas, i: Int) {
@@ -2471,6 +2620,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             SETTINGS_ICON -> glyphGear(canvas, cx, cy, half, hole)
             YOUTUBE_ICON -> glyphPlay(canvas, cx, cy, half, hole)
             GAME_ICON -> glyphCube(canvas, cx, cy, half)
+            GAMES_ICON -> glyphPad(canvas, cx, cy, half, hole)
             else -> glyphGrid(canvas, cx, cy, half)
         }
 
@@ -2522,6 +2672,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val ICON_COUNT = 4
         const val YOUTUBE_ICON = 1   // o ícone vermelho abre o YouTube
         const val SETTINGS_ICON = 0  // o ícone verde abre as configurações
+        const val GAMES_ICON = 2     // o ícone azul abre a lista de jogos instalados
         const val GAME_ICON = 3      // o ícone amarelo abre o jogo de empilhar blocos
 
         // Formatos da barra.
@@ -2555,6 +2706,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val PILL = ICON_COUNT + 8          // pinça no botão ••• de uma janela
         const val DOT = ICON_COUNT + 9           // pinça na bolinha que fecha a janela
         const val POP = ICON_COUNT + 10          // pinça num item da lista do •••
+        const val APP_TILE = ICON_COUNT + 11     // pinça num jogo da lista de Jogos
 
         // Jogo 3D de empilhar blocos (a mesa tem 1,0 de lado).
         const val GAME_BLOCKS = 5
