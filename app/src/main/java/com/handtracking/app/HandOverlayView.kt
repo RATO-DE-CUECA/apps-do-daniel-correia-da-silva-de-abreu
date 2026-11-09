@@ -11,6 +11,7 @@ import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.util.Base64
 import android.os.SystemClock
 import android.util.AttributeSet
 import android.view.MotionEvent
@@ -47,8 +48,10 @@ import kotlin.math.sqrt
  *  - Menu azul ("Jogos"): abre jogos instalados no celular (APK), como o Gorilla MR. O app acha o jogo pelo
  *    nome na lista de apps do celular, então não precisa copiar nada do jogo para dentro deste app.
  *  - Jogo "Tiro" (teste), pela lista de Jogos: ao fechar a mão toda, aparece uma pistola feita de blocos na
- *    sua mão (passo 1: só segurar; atirar vem depois). A pistola é 3D: ela gira junto com a mão (a orientação
- *    da mão em 3D vem dos pontos x, y e z do MediaPipe). Com a mão fechada ela não conta como pinça.
+ *    sua mão (passo 1: só segurar; atirar vem depois). A pistola é um modelo 3D: ela gira junto com a mão (a
+ *    orientação da mão em 3D vem dos pontos x, y e z do MediaPipe). Com a mão fechada ela não conta como pinça.
+ *    Modelo: "PSX Firearms Free" de heyheythere, licença CC BY 4.0 (https://heyheythere.itch.io/psx-firearms-free),
+ *    convertido para triângulos de cor lisa e guardado em GUN_MODEL (244 triângulos).
  *  - Menu amarelo: mini jogo 3D de empilhar blocos numa mesa. Pinça num bloco: ele sobe e você leva
  *    até onde quer (a marca amarela na mesa mostra onde ele vai cair); solta para cair. Para ver a mesa
  *    de outros lados: vire a cabeça (a mesa "gira" junto) ou faça pinça na mesa e arraste. O botão
@@ -250,24 +253,15 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     private val gunTmpX = FloatArray(21)
     private val gunTmpY = FloatArray(21)
     private val gunTmpZ = FloatArray(21)
-    // Modelo 3D da pistola: faces dos blocos (4 pontos, normal e cor), montadas uma vez; e áreas de trabalho do desenho.
-    private var gunQuadCount = 0
-    private val gunLV = FloatArray(GUN_MAX_QUADS * 12)
-    private val gunLN = FloatArray(GUN_MAX_QUADS * 3)
-    private val gunLC = IntArray(GUN_MAX_QUADS)
-    private val gunWV = FloatArray(GUN_MAX_QUADS * 12)
-    private val gunWZ = FloatArray(GUN_MAX_QUADS)
-    private val gunWS = FloatArray(GUN_MAX_QUADS)
-    private val gunOrd = IntArray(GUN_MAX_QUADS)
-    // Pistola em blocos, vista de lado (cano para a direita). S corpo, R mira, M ponta do cano, G cabo, K gatilho.
-    private val gunRows = arrayOf(
-        ".R....R.",
-        "SSSSSSSM",
-        "SSSSSSSM",
-        ".GGK....",
-        ".GG.....",
-        "GGG....."
-    )
+    // Modelo 3D da pistola: triângulos (3 pontos, normal e cor), montados uma vez; e áreas de trabalho do desenho.
+    private var gunFaceCount = 0
+    private val gunLV = FloatArray(GUN_MAX_FACES * 9)
+    private val gunLN = FloatArray(GUN_MAX_FACES * 3)
+    private val gunLC = IntArray(GUN_MAX_FACES)
+    private val gunWV = FloatArray(GUN_MAX_FACES * 9)
+    private val gunWZ = FloatArray(GUN_MAX_FACES)
+    private val gunWS = FloatArray(GUN_MAX_FACES)
+    private val gunOrd = IntArray(GUN_MAX_FACES)
     private val gunPaint = Paint().apply {
         isAntiAlias = true
         style = Paint.Style.STROKE
@@ -2241,89 +2235,70 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         drawPistol3D(canvas, cx - 2f * s * cyw, cy + 2f * s * syw * sp2, cyw, syw * sp2, -syw * cp, 0f, -cp, -sp2, s)
     }
 
-    private fun gunCellColor(c: Char): Int = when (c) {
-        'R' -> Color.rgb(232, 72, 62)
-        'S' -> Color.rgb(176, 182, 194)
-        'M' -> Color.rgb(255, 152, 40)
-        'G' -> Color.rgb(66, 78, 108)
-        else -> Color.rgb(40, 44, 56)      // K: gatilho
-    }
-
-    private fun gunFilled(c: Int, r: Int): Boolean {
-        if (r < 0 || r >= gunRows.size || c < 0 || c >= gunRows[r].length) return false
-        return gunRows[r][c] != '.'
-    }
-
-    private fun gunAddQuad(
-        x0: Float, y0: Float, z0: Float, x1: Float, y1: Float, z1: Float,
-        x2: Float, y2: Float, z2: Float, x3: Float, y3: Float, z3: Float,
-        nx: Float, ny: Float, nz: Float, color: Int
-    ) {
-        if (gunQuadCount >= GUN_MAX_QUADS) return
-        val q = gunQuadCount++
-        val o = q * 12
-        gunLV[o] = x0; gunLV[o + 1] = y0; gunLV[o + 2] = z0
-        gunLV[o + 3] = x1; gunLV[o + 4] = y1; gunLV[o + 5] = z1
-        gunLV[o + 6] = x2; gunLV[o + 7] = y2; gunLV[o + 8] = z2
-        gunLV[o + 9] = x3; gunLV[o + 10] = y3; gunLV[o + 11] = z3
-        gunLN[q * 3] = nx
-        gunLN[q * 3 + 1] = ny
-        gunLN[q * 3 + 2] = nz
-        gunLC[q] = color
-    }
-
-    /**
-     * Monta o modelo 3D: cada bloco do desenho (gunRows) vira um cubinho com 2 de espessura, e só as faces
-     * que ficam para fora entram. Eixos do modelo: x = cano, y = para cima, z = de lado. Unidade = 1 bloco.
-     */
+    /** Monta os triângulos da pistola a partir do texto em GUN_MODEL (uma vez só). */
     private fun buildGunMesh() {
-        gunQuadCount = 0
-        val layers = 2
-        for (r in gunRows.indices) {
-            for (c in 0 until gunRows[r].length) {
-                if (!gunFilled(c, r)) continue
-                val base = gunCellColor(gunRows[r][c])
-                val x0 = c - 2f
-                val x1 = x0 + 1f
-                val y1 = 4.5f - r
-                val y0 = y1 - 1f
-                for (l in 0 until layers) {
-                    val z0 = l - 1f
-                    val z1 = z0 + 1f
-                    if (!gunFilled(c + 1, r)) gunAddQuad(x1, y0, z0, x1, y0, z1, x1, y1, z1, x1, y1, z0, 1f, 0f, 0f, base)
-                    if (!gunFilled(c - 1, r)) gunAddQuad(x0, y0, z1, x0, y0, z0, x0, y1, z0, x0, y1, z1, -1f, 0f, 0f, base)
-                    if (!gunFilled(c, r - 1)) gunAddQuad(x0, y1, z0, x1, y1, z0, x1, y1, z1, x0, y1, z1, 0f, 1f, 0f, base)
-                    if (!gunFilled(c, r + 1)) gunAddQuad(x0, y0, z1, x1, y0, z1, x1, y0, z0, x0, y0, z0, 0f, -1f, 0f, base)
-                    if (l == layers - 1) gunAddQuad(x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1, 0f, 0f, 1f, base)
-                    if (l == 0) gunAddQuad(x1, y0, z0, x0, y0, z0, x0, y1, z0, x1, y1, z0, 0f, 0f, -1f, base)
+        gunFaceCount = 0
+        try {
+            val bytes = Base64.decode(GUN_MODEL, Base64.DEFAULT)
+            val bb = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            val n = min(bb.short.toInt() and 0xFFFF, GUN_MAX_FACES)
+            for (f in 0 until n) {
+                val o = f * 9
+                for (k in 0 until 9) gunLV[o + k] = bb.short / 1000f
+                val r = bb.get().toInt() and 0xFF
+                val g = bb.get().toInt() and 0xFF
+                val b = bb.get().toInt() and 0xFF
+                gunLC[f] = Color.rgb(r, g, b)
+                // Normal do triângulo (para fora), pelo produto vetorial.
+                val e1x = gunLV[o + 3] - gunLV[o]
+                val e1y = gunLV[o + 4] - gunLV[o + 1]
+                val e1z = gunLV[o + 5] - gunLV[o + 2]
+                val e2x = gunLV[o + 6] - gunLV[o]
+                val e2y = gunLV[o + 7] - gunLV[o + 1]
+                val e2z = gunLV[o + 8] - gunLV[o + 2]
+                var nx = e1y * e2z - e1z * e2y
+                var ny = e1z * e2x - e1x * e2z
+                var nz = e1x * e2y - e1y * e2x
+                val nl = sqrt(nx * nx + ny * ny + nz * nz)
+                if (nl > 1e-9f) {
+                    nx /= nl
+                    ny /= nl
+                    nz /= nl
                 }
+                gunLN[f * 3] = nx
+                gunLN[f * 3 + 1] = ny
+                gunLN[f * 3 + 2] = nz
             }
+            gunFaceCount = n
+        } catch (e: Exception) {
+            gunFaceCount = 0
         }
     }
 
     /**
      * Desenha a pistola em 3D. (cx, cy) = onde fica o meio do cabo na tela; (ax, ay, az) = para onde aponta o cano;
      * (bx, by, bz) = para cima da pistola; os dois em pixels da imagem, com z positivo = para longe da câmera.
-     * s = tamanho de um bloco em pixels. Só as faces viradas para a câmera são desenhadas, de trás para frente.
+     * s = tamanho de um bloco em pixels. Só os triângulos virados para a câmera são desenhados, de trás para frente.
      */
     private fun drawPistol3D(canvas: Canvas, cx: Float, cy: Float, ax: Float, ay: Float, az: Float, bx: Float, by: Float, bz: Float, s: Float) {
-        if (gunQuadCount == 0) buildGunMesh()
+        if (gunFaceCount == 0) buildGunMesh()
+        if (gunFaceCount == 0) return
         // Terceiro eixo (de lado) = produto vetorial.
         val sx = ay * bz - az * by
         val sy = az * bx - ax * bz
         val sz = ax * by - ay * bx
         var n = 0
-        for (q in 0 until gunQuadCount) {
+        for (q in 0 until gunFaceCount) {
             val nx = gunLN[q * 3]
             val ny = gunLN[q * 3 + 1]
             val nz = gunLN[q * 3 + 2]
             val wnx = ax * nx + bx * ny + sx * nz
             val wny = ay * nx + by * ny + sy * nz
             val wnz = az * nx + bz * ny + sz * nz
-            if (wnz >= 0f) continue                       // essa face olha para longe da câmera
+            if (wnz >= 0f) continue                       // esse triângulo olha para longe da câmera
             var zsum = 0f
-            val o = q * 12
-            for (k in 0 until 4) {
+            val o = q * 9
+            for (k in 0 until 3) {
                 val lx = gunLV[o + k * 3]
                 val ly = gunLV[o + k * 3 + 1]
                 val lz = gunLV[o + k * 3 + 2]
@@ -2333,10 +2308,10 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 gunWV[o + k * 3 + 2] = zz
                 zsum += zz
             }
-            gunWZ[q] = zsum / 4f
+            gunWZ[q] = zsum / 3f
             // Luz vinda de cima, da esquerda e de frente (da câmera).
             val dot = -(wnx * 0.35f + wny * 0.55f + wnz * 0.75f) / 0.99f
-            gunWS[q] = 0.5f + 0.5f * max(0f, dot)
+            gunWS[q] = 0.55f + 0.5f * max(0f, dot)
             gunOrd[n++] = q
         }
         // De trás (z grande) para frente (z pequeno).
@@ -2349,18 +2324,19 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             }
             gunOrd[b + 1] = v
         }
-        gunPaint.strokeWidth = max(1.2f, s * 0.07f)
+        gunPaint.strokeWidth = max(1f, s * 0.05f)
         for (i in 0 until n) {
             val q = gunOrd[i]
-            val o = q * 12
+            val o = q * 9
             facePath.reset()
             facePath.moveTo(gunWV[o], gunWV[o + 1])
             facePath.lineTo(gunWV[o + 3], gunWV[o + 4])
             facePath.lineTo(gunWV[o + 6], gunWV[o + 7])
-            facePath.lineTo(gunWV[o + 9], gunWV[o + 10])
             facePath.close()
-            fillPaint.color = shade(gunLC[q], gunWS[q])
+            val c = shade(gunLC[q], gunWS[q])
+            fillPaint.color = c
             canvas.drawPath(facePath, fillPaint)
+            gunPaint.color = c                       // contorno da mesma cor: tapa as frestinhas entre triângulos
             canvas.drawPath(facePath, gunPaint)
         }
     }
@@ -2378,6 +2354,9 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         for (h in 0 until MAX_HANDS) if (gunOn[h]) holding++
         thinPaint.color = if (holding > 0) Color.rgb(160, 235, 150) else Color.argb(190, 255, 255, 255)
         canvas.drawText(if (holding > 0) "Pistola na mão" else "Mostre a mão e feche o punho", panelLeft + bw * 0.05f, panelTop + panelH * 0.84f, thinPaint)
+        thinPaint.color = Color.argb(170, 255, 255, 255)
+        thinPaint.textSize = bw * 0.028f
+        canvas.drawText("Pistola: PSX Firearms Free, heyheythere (CC BY 4.0)", panelLeft + bw * 0.05f, panelTop + panelH * 0.95f, thinPaint)
         thinPaint.color = Color.WHITE
         // A pistola da vitrine gira devagar, para mostrar que é 3D.
         val spin = (SystemClock.uptimeMillis() % 7000L) / 7000f * TWO_PI_F
@@ -3026,7 +3005,10 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val GAMES_ICON = 2     // o ícone azul abre a lista de jogos
         const val SHOOT_MENU = 4     // jogo de tiro (teste)
         const val GUN_ON_FRAMES = 3  // quadros com a mão fechada para a pistola aparecer
-        const val GUN_MAX_QUADS = 400 // faces da pistola 3D
+        const val GUN_MAX_FACES = 400 // triângulos da pistola 3D
+        // Pistola 9mm (PSX Firearms Free, heyheythere, CC BY 4.0): 244 triângulos. Formato: 2 bytes com a quantidade;
+        // depois, para cada triângulo, 3 pontos (x = cano, y = cima, z = lado, em milésimos de bloco, 16 bits) e a cor (RGB).
+        const val GUN_MODEL = "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"
         const val GUN_Z_GAIN = 1.0f   // quanto confiar na profundidade (z) dos pontos da mão
         const val GUN_OFF_FRAMES = 4 // quadros com a mão aberta para a pistola sumir
         const val GAME_ICON = 3      // o ícone amarelo abre o jogo de empilhar blocos
