@@ -47,7 +47,8 @@ import kotlin.math.sqrt
  *  - Menu azul ("Jogos"): abre jogos instalados no celular (APK), como o Gorilla MR. O app acha o jogo pelo
  *    nome na lista de apps do celular, então não precisa copiar nada do jogo para dentro deste app.
  *  - Jogo "Tiro" (teste), pela lista de Jogos: ao fechar a mão toda, aparece uma pistola feita de blocos na
- *    sua mão (passo 1: só segurar; atirar vem depois). Enquanto a mão está fechada ela não conta como pinça.
+ *    sua mão (passo 1: só segurar; atirar vem depois). A pistola é 3D: ela gira junto com a mão (a orientação
+ *    da mão em 3D vem dos pontos x, y e z do MediaPipe). Com a mão fechada ela não conta como pinça.
  *  - Menu amarelo: mini jogo 3D de empilhar blocos numa mesa. Pinça num bloco: ele sobe e você leva
  *    até onde quer (a marca amarela na mesa mostra onde ele vai cair); solta para cair. Para ver a mesa
  *    de outros lados: vire a cabeça (a mesa "gira" junto) ou faça pinça na mesa e arraste. O botão
@@ -239,13 +240,25 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     private val gunCnt = IntArray(MAX_HANDS)            // contador para não piscar (histerese)
     private val gunX = FloatArray(MAX_HANDS)            // centro da palma, em pixels da imagem (suavizado)
     private val gunY = FloatArray(MAX_HANDS)
-    private val gunUX = FloatArray(MAX_HANDS)           // para onde aponta o cano (do pulso para os nós dos dedos)
-    private val gunUY = FloatArray(MAX_HANDS)
-    private val gunVX = FloatArray(MAX_HANDS)           // "para cima" da pistola (lado do polegar)
-    private val gunVY = FloatArray(MAX_HANDS)
-    private val gunHS = FloatArray(MAX_HANDS)           // tamanho da mão (pulso até o nó do dedo médio)
+    private val gunAX = FloatArray(MAX_HANDS)           // para onde aponta o cano (pulso -> nó do dedo médio), em 3D
+    private val gunAY = FloatArray(MAX_HANDS)
+    private val gunAZ = FloatArray(MAX_HANDS)
+    private val gunBX = FloatArray(MAX_HANDS)           // "para cima" da pistola (lado do polegar), em 3D
+    private val gunBY = FloatArray(MAX_HANDS)
+    private val gunBZ = FloatArray(MAX_HANDS)
+    private val gunHS = FloatArray(MAX_HANDS)           // tamanho da mão em 3D (pulso até o nó do dedo médio)
     private val gunTmpX = FloatArray(21)
     private val gunTmpY = FloatArray(21)
+    private val gunTmpZ = FloatArray(21)
+    // Modelo 3D da pistola: faces dos blocos (4 pontos, normal e cor), montadas uma vez; e áreas de trabalho do desenho.
+    private var gunQuadCount = 0
+    private val gunLV = FloatArray(GUN_MAX_QUADS * 12)
+    private val gunLN = FloatArray(GUN_MAX_QUADS * 3)
+    private val gunLC = IntArray(GUN_MAX_QUADS)
+    private val gunWV = FloatArray(GUN_MAX_QUADS * 12)
+    private val gunWZ = FloatArray(GUN_MAX_QUADS)
+    private val gunWS = FloatArray(GUN_MAX_QUADS)
+    private val gunOrd = IntArray(GUN_MAX_QUADS)
     // Pistola em blocos, vista de lado (cano para a direita). S corpo, R mira, M ponta do cano, G cabo, K gatilho.
     private val gunRows = arrayOf(
         ".R....R.",
@@ -602,7 +615,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         notifyWebPanel(iw, ih)
 
         // O jogo precisa redesenhar sempre (os blocos caem sozinhos).
-        if (isGameOpen() || animating) postInvalidateOnAnimation()
+        if (isGameOpen() || animating || openMenu == SHOOT_MENU) postInvalidateOnAnimation()
     }
 
     /** O menu verde é o das configurações. */
@@ -1039,8 +1052,9 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     for (k in 0 until 21) {
                         gunTmpX[k] = hand[k].x() * iw
                         gunTmpY[k] = hand[k].y() * ih
+                        gunTmpZ[k] = hand[k].z() * iw      // profundidade: na mesma escala do x (negativo = mais perto)
                     }
-                    updateGunHand(hIdx, gunTmpX, gunTmpY)
+                    updateGunHand(hIdx, gunTmpX, gunTmpY, gunTmpZ)
                 } else if (hIdx < MAX_HANDS) {
                     gunOn[hIdx] = false
                     gunCnt[hIdx] = 0
@@ -2090,8 +2104,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             }
             val cx = tileL[g] + tileW / 2f
             if (appGameMenu[g] == SHOOT_MENU) {
-                val sz = tileH * 0.065f
-                drawPistolBlocks(canvas, cx, tileT + tileH * 0.37f, 1f, 0f, 0f, -1f, sz)
+                drawPistolPreview(canvas, cx, tileT + tileH * 0.37f, tileH * 0.075f, 0.6f, 0.32f)
             } else if (appGameBuiltIn[g]) {
                 glyphCube(canvas, cx, tileT + tileH * 0.36f, tileH * 0.34f)
             } else {
@@ -2110,11 +2123,11 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
     /**
      * Vê se a mão está totalmente fechada (as pontas dos 4 dedos ficam perto do pulso) e guarda onde e
-     * para que lado a pistola deve ficar. xs/ys: os 21 pontos da mão, em pixels da imagem.
+     * para que lado a pistola deve ficar, em 3D. xs/ys/zs: os 21 pontos da mão (x e y em pixels da imagem).
      */
-    private fun updateGunHand(h: Int, xs: FloatArray, ys: FloatArray) {
-        val hs = hypot(xs[WRIST] - xs[MIDDLE_MCP], ys[WRIST] - ys[MIDDLE_MCP])
-        if (hs < 8f) {
+    private fun updateGunHand(h: Int, xs: FloatArray, ys: FloatArray, zs: FloatArray) {
+        val hs2 = hypot(xs[WRIST] - xs[MIDDLE_MCP], ys[WRIST] - ys[MIDDLE_MCP])
+        if (hs2 < 8f) {
             gunOn[h] = false
             gunCnt[h] = 0
             return
@@ -2136,62 +2149,96 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             if (gunCnt[h] > 0) gunCnt[h] = 0
             gunCnt[h] = max(gunCnt[h] - 1, -20)
         }
+        val wasOn = gunOn[h]
         if (gunCnt[h] >= GUN_ON_FRAMES) gunOn[h] = true else if (gunCnt[h] <= -GUN_OFF_FRAMES) gunOn[h] = false
 
-        // Onde e para que lado: centro da palma, "frente" (pulso -> nó do dedo médio) e "cima" (lado do polegar).
+        // Centro da palma.
         val ox = (xs[0] + xs[5] + xs[9] + xs[13] + xs[17]) / 5f
         val oy = (ys[0] + ys[5] + ys[9] + ys[13] + ys[17]) / 5f
-        var ux = xs[MIDDLE_MCP] - xs[WRIST]
-        var uy = ys[MIDDLE_MCP] - ys[WRIST]
-        val un = hypot(ux, uy)
-        ux /= un
-        uy /= un
-        var tx = xs[2] - xs[17]
-        var ty = ys[2] - ys[17]
-        val proj = tx * ux + ty * uy
-        tx -= proj * ux
-        ty -= proj * uy
-        val tn = hypot(tx, ty)
-        if (tn < 1e-3f) return
-        tx /= tn
-        ty /= tn
-        // Suaviza, para a pistola não tremer junto com os pontos da mão.
-        val k = 0.5f
+        // Eixo do cano: do pulso para o nó do dedo médio (em 3D).
+        var ax = xs[MIDDLE_MCP] - xs[WRIST]
+        var ay = ys[MIDDLE_MCP] - ys[WRIST]
+        var az = (zs[MIDDLE_MCP] - zs[WRIST]) * GUN_Z_GAIN
+        val an = sqrt(ax * ax + ay * ay + az * az)
+        if (an < 1e-3f) return
+        ax /= an
+        ay /= an
+        az /= an
+        // Eixo "para cima": de um lado a outro da palma (mindinho -> indicador), sem a parte que já é do cano.
+        var bx = xs[5] - xs[17]
+        var by = ys[5] - ys[17]
+        var bz = (zs[5] - zs[17]) * GUN_Z_GAIN
+        val pr = bx * ax + by * ay + bz * az
+        bx -= pr * ax
+        by -= pr * ay
+        bz -= pr * az
+        val bn = sqrt(bx * bx + by * by + bz * bz)
+        if (bn < 1e-3f) return
+        bx /= bn
+        by /= bn
+        bz /= bn
+
+        // Suaviza (sem suavizar enquanto a pistola ainda não está na mão, para ela já nascer no lugar certo).
+        val k = if (wasOn) 0.5f else 1f
         gunX[h] += (ox - gunX[h]) * k
         gunY[h] += (oy - gunY[h]) * k
-        gunHS[h] += (hs - gunHS[h]) * k
-        var sux = gunUX[h] + (ux - gunUX[h]) * k
-        var suy = gunUY[h] + (uy - gunUY[h]) * k
-        val sun = hypot(sux, suy)
-        if (sun > 1e-4f) {
-            sux /= sun
-            suy /= sun
-            gunUX[h] = sux
-            gunUY[h] = suy
+        gunHS[h] += (an - gunHS[h]) * k
+        var sax = gunAX[h] + (ax - gunAX[h]) * k
+        var say = gunAY[h] + (ay - gunAY[h]) * k
+        var saz = gunAZ[h] + (az - gunAZ[h]) * k
+        val sn = sqrt(sax * sax + say * say + saz * saz)
+        if (sn > 1e-4f) {
+            sax /= sn
+            say /= sn
+            saz /= sn
         } else {
-            gunUX[h] = ux
-            gunUY[h] = uy
+            sax = ax
+            say = ay
+            saz = az
         }
-        var svx = gunVX[h] + (tx - gunVX[h]) * k
-        var svy = gunVY[h] + (ty - gunVY[h]) * k
-        val svn = hypot(svx, svy)
-        if (svn > 1e-4f) {
-            gunVX[h] = svx / svn
-            gunVY[h] = svy / svn
+        var sbx = gunBX[h] + (bx - gunBX[h]) * k
+        var sby = gunBY[h] + (by - gunBY[h]) * k
+        var sbz = gunBZ[h] + (bz - gunBZ[h]) * k
+        // Mantém os dois eixos em ângulo reto.
+        val d = sbx * sax + sby * say + sbz * saz
+        sbx -= d * sax
+        sby -= d * say
+        sbz -= d * saz
+        val sbn = sqrt(sbx * sbx + sby * sby + sbz * sbz)
+        if (sbn > 1e-4f) {
+            sbx /= sbn
+            sby /= sbn
+            sbz /= sbn
         } else {
-            gunVX[h] = tx
-            gunVY[h] = ty
+            sbx = bx
+            sby = by
+            sbz = bz
         }
+        gunAX[h] = sax
+        gunAY[h] = say
+        gunAZ[h] = saz
+        gunBX[h] = sbx
+        gunBY[h] = sby
+        gunBZ[h] = sbz
     }
 
-    /** Desenha a pistola de blocos na mão h (as posições estão em pixels da imagem; aqui vira pixels da tela). */
+    /** Desenha a pistola 3D na mão h (as posições estão em pixels da imagem; aqui vira pixels da tela). */
     private fun drawPistol(canvas: Canvas, h: Int, scale: Float, ox: Float, oy: Float) {
         val hs = gunHS[h] * scale
         if (hs < 6f) return
-        drawPistolBlocks(
+        drawPistol3D(
             canvas, gunX[h] * scale + ox, gunY[h] * scale + oy,
-            gunUX[h], gunUY[h], gunVX[h], gunVY[h], hs * 0.2f
+            gunAX[h], gunAY[h], gunAZ[h], gunBX[h], gunBY[h], gunBZ[h], hs * 0.2f
         )
+    }
+
+    /** Pistola girando devagar (para a vitrine nos menus). yaw e pitch em radianos. */
+    private fun drawPistolPreview(canvas: Canvas, cx: Float, cy: Float, s: Float, yaw: Float, pitch: Float) {
+        val cyw = cos(yaw)
+        val syw = sin(yaw)
+        val cp = cos(pitch)
+        val sp2 = sin(pitch)
+        drawPistol3D(canvas, cx - 2f * s * cyw, cy + 2f * s * syw * sp2, cyw, syw * sp2, -syw * cp, 0f, -cp, -sp2, s)
     }
 
     private fun gunCellColor(c: Char): Int = when (c) {
@@ -2207,71 +2254,115 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         return gunRows[r][c] != '.'
     }
 
+    private fun gunAddQuad(
+        x0: Float, y0: Float, z0: Float, x1: Float, y1: Float, z1: Float,
+        x2: Float, y2: Float, z2: Float, x3: Float, y3: Float, z3: Float,
+        nx: Float, ny: Float, nz: Float, color: Int
+    ) {
+        if (gunQuadCount >= GUN_MAX_QUADS) return
+        val q = gunQuadCount++
+        val o = q * 12
+        gunLV[o] = x0; gunLV[o + 1] = y0; gunLV[o + 2] = z0
+        gunLV[o + 3] = x1; gunLV[o + 4] = y1; gunLV[o + 5] = z1
+        gunLV[o + 6] = x2; gunLV[o + 7] = y2; gunLV[o + 8] = z2
+        gunLV[o + 9] = x3; gunLV[o + 10] = y3; gunLV[o + 11] = z3
+        gunLN[q * 3] = nx
+        gunLN[q * 3 + 1] = ny
+        gunLN[q * 3 + 2] = nz
+        gunLC[q] = color
+    }
+
     /**
-     * Pistola de blocos vista de lado. (cx, cy) = onde fica o meio do cabo; (ux, uy) = para onde aponta o cano;
-     * (vx, vy) = para cima da pistola; s = tamanho de um bloco. Cada bloco é um cubinho: a frente e dois lados.
+     * Monta o modelo 3D: cada bloco do desenho (gunRows) vira um cubinho com 2 de espessura, e só as faces
+     * que ficam para fora entram. Eixos do modelo: x = cano, y = para cima, z = de lado. Unidade = 1 bloco.
      */
-    private fun drawPistolBlocks(canvas: Canvas, cx: Float, cy: Float, ux: Float, uy: Float, vx: Float, vy: Float, s: Float) {
-        // Profundidade do bloco na tela (como se o cubo fosse empurrado para trás, para cima e para a direita).
-        val dx = s * 0.62f
-        val dy = -s * 0.62f
-        gunPaint.strokeWidth = max(1.3f, s * 0.07f)
-        // Passada 1: os lados dos blocos (parte de trás); passada 2: as frentes, por cima.
-        for (pass in 0..1) {
-            for (r in gunRows.indices) {
-                for (c in 0 until gunRows[r].length) {
-                    val ch = gunRows[r][c]
-                    if (ch == '.') continue
-                    val base = gunCellColor(ch)
-                    // Cantos da frente do bloco: 0 = trás/cima, 1 = frente/cima, 2 = frente/baixo, 3 = trás/baixo.
-                    val xs0 = (c - 2f) * s
-                    val xs1 = (c + 1 - 2f) * s
-                    val ys0 = (4.5f - r) * s
-                    val ys1 = (4.5f - (r + 1)) * s
-                    val ax = cx + ux * xs0 + vx * ys0
-                    val ay = cy + uy * xs0 + vy * ys0
-                    val bx = cx + ux * xs1 + vx * ys0
-                    val by = cy + uy * xs1 + vy * ys0
-                    val ex = cx + ux * xs1 + vx * ys1
-                    val ey = cy + uy * xs1 + vy * ys1
-                    val fx = cx + ux * xs0 + vx * ys1
-                    val fy = cy + uy * xs0 + vy * ys1
-                    if (pass == 0) {
-                        // Lados que aparecem: os que olham para o lado da profundidade (dx, dy).
-                        if (!gunFilled(c, r - 1) && vx * dx + vy * dy > 0f) gunSide(canvas, ax, ay, bx, by, dx, dy, base, vx, vy)
-                        if (!gunFilled(c, r + 1) && -(vx * dx + vy * dy) > 0f) gunSide(canvas, fx, fy, ex, ey, dx, dy, base, -vx, -vy)
-                        if (!gunFilled(c + 1, r) && ux * dx + uy * dy > 0f) gunSide(canvas, bx, by, ex, ey, dx, dy, base, ux, uy)
-                        if (!gunFilled(c - 1, r) && -(ux * dx + uy * dy) > 0f) gunSide(canvas, ax, ay, fx, fy, dx, dy, base, -ux, -uy)
-                    } else {
-                        facePath.reset()
-                        facePath.moveTo(ax, ay)
-                        facePath.lineTo(bx, by)
-                        facePath.lineTo(ex, ey)
-                        facePath.lineTo(fx, fy)
-                        facePath.close()
-                        fillPaint.color = base
-                        canvas.drawPath(facePath, fillPaint)
-                        canvas.drawPath(facePath, gunPaint)
-                    }
+    private fun buildGunMesh() {
+        gunQuadCount = 0
+        val layers = 2
+        for (r in gunRows.indices) {
+            for (c in 0 until gunRows[r].length) {
+                if (!gunFilled(c, r)) continue
+                val base = gunCellColor(gunRows[r][c])
+                val x0 = c - 2f
+                val x1 = x0 + 1f
+                val y1 = 4.5f - r
+                val y0 = y1 - 1f
+                for (l in 0 until layers) {
+                    val z0 = l - 1f
+                    val z1 = z0 + 1f
+                    if (!gunFilled(c + 1, r)) gunAddQuad(x1, y0, z0, x1, y0, z1, x1, y1, z1, x1, y1, z0, 1f, 0f, 0f, base)
+                    if (!gunFilled(c - 1, r)) gunAddQuad(x0, y0, z1, x0, y0, z0, x0, y1, z0, x0, y1, z1, -1f, 0f, 0f, base)
+                    if (!gunFilled(c, r - 1)) gunAddQuad(x0, y1, z0, x1, y1, z0, x1, y1, z1, x0, y1, z1, 0f, 1f, 0f, base)
+                    if (!gunFilled(c, r + 1)) gunAddQuad(x0, y0, z1, x1, y0, z1, x1, y0, z0, x0, y0, z0, 0f, -1f, 0f, base)
+                    if (l == layers - 1) gunAddQuad(x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1, 0f, 0f, 1f, base)
+                    if (l == 0) gunAddQuad(x1, y0, z0, x0, y0, z0, x0, y1, z0, x1, y1, z0, 0f, 0f, -1f, base)
                 }
             }
         }
     }
 
-    /** Lado de um bloco: o retângulo entre uma aresta da frente e a mesma aresta empurrada para trás. */
-    private fun gunSide(canvas: Canvas, x0: Float, y0: Float, x1: Float, y1: Float, dx: Float, dy: Float, base: Int, nx: Float, ny: Float) {
-        // Luz vem de cima e da esquerda: lados virados para cima ficam claros, os da direita ficam escuros.
-        val light = max(0f, nx * -0.4f + ny * -0.9f)
-        val f = 0.52f + 0.34f * light
-        facePath.reset()
-        facePath.moveTo(x0, y0)
-        facePath.lineTo(x1, y1)
-        facePath.lineTo(x1 + dx, y1 + dy)
-        facePath.lineTo(x0 + dx, y0 + dy)
-        facePath.close()
-        fillPaint.color = shade(base, f)
-        canvas.drawPath(facePath, fillPaint)
-        canvas.drawPath(facePath, gunPaint)
+    /**
+     * Desenha a pistola em 3D. (cx, cy) = onde fica o meio do cabo na tela; (ax, ay, az) = para onde aponta o cano;
+     * (bx, by, bz) = para cima da pistola; os dois em pixels da imagem, com z positivo = para longe da câmera.
+     * s = tamanho de um bloco em pixels. Só as faces viradas para a câmera são desenhadas, de trás para frente.
+     */
+    private fun drawPistol3D(canvas: Canvas, cx: Float, cy: Float, ax: Float, ay: Float, az: Float, bx: Float, by: Float, bz: Float, s: Float) {
+        if (gunQuadCount == 0) buildGunMesh()
+        // Terceiro eixo (de lado) = produto vetorial.
+        val sx = ay * bz - az * by
+        val sy = az * bx - ax * bz
+        val sz = ax * by - ay * bx
+        var n = 0
+        for (q in 0 until gunQuadCount) {
+            val nx = gunLN[q * 3]
+            val ny = gunLN[q * 3 + 1]
+            val nz = gunLN[q * 3 + 2]
+            val wnx = ax * nx + bx * ny + sx * nz
+            val wny = ay * nx + by * ny + sy * nz
+            val wnz = az * nx + bz * ny + sz * nz
+            if (wnz >= 0f) continue                       // essa face olha para longe da câmera
+            var zsum = 0f
+            val o = q * 12
+            for (k in 0 until 4) {
+                val lx = gunLV[o + k * 3]
+                val ly = gunLV[o + k * 3 + 1]
+                val lz = gunLV[o + k * 3 + 2]
+                gunWV[o + k * 3] = cx + (ax * lx + bx * ly + sx * lz) * s
+                gunWV[o + k * 3 + 1] = cy + (ay * lx + by * ly + sy * lz) * s
+                val zz = (az * lx + bz * ly + sz * lz) * s
+                gunWV[o + k * 3 + 2] = zz
+                zsum += zz
+            }
+            gunWZ[q] = zsum / 4f
+            // Luz vinda de cima, da esquerda e de frente (da câmera).
+            val dot = -(wnx * 0.35f + wny * 0.55f + wnz * 0.75f) / 0.99f
+            gunWS[q] = 0.5f + 0.5f * max(0f, dot)
+            gunOrd[n++] = q
+        }
+        // De trás (z grande) para frente (z pequeno).
+        for (a in 1 until n) {
+            val v = gunOrd[a]
+            var b = a - 1
+            while (b >= 0 && gunWZ[gunOrd[b]] < gunWZ[v]) {
+                gunOrd[b + 1] = gunOrd[b]
+                b--
+            }
+            gunOrd[b + 1] = v
+        }
+        gunPaint.strokeWidth = max(1.2f, s * 0.07f)
+        for (i in 0 until n) {
+            val q = gunOrd[i]
+            val o = q * 12
+            facePath.reset()
+            facePath.moveTo(gunWV[o], gunWV[o + 1])
+            facePath.lineTo(gunWV[o + 3], gunWV[o + 4])
+            facePath.lineTo(gunWV[o + 6], gunWV[o + 7])
+            facePath.lineTo(gunWV[o + 9], gunWV[o + 10])
+            facePath.close()
+            fillPaint.color = shade(gunLC[q], gunWS[q])
+            canvas.drawPath(facePath, fillPaint)
+            canvas.drawPath(facePath, gunPaint)
+        }
     }
 
     /** Janela do jogo de tiro: explica como pegar a pistola e mostra se ela está na mão. */
@@ -2288,7 +2379,9 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         thinPaint.color = if (holding > 0) Color.rgb(160, 235, 150) else Color.argb(190, 255, 255, 255)
         canvas.drawText(if (holding > 0) "Pistola na mão" else "Mostre a mão e feche o punho", panelLeft + bw * 0.05f, panelTop + panelH * 0.84f, thinPaint)
         thinPaint.color = Color.WHITE
-        drawPistolBlocks(canvas, panelLeft + bw * 0.78f, panelTop + panelH * 0.50f, 1f, 0f, 0f, -1f, panelH * 0.068f)
+        // A pistola da vitrine gira devagar, para mostrar que é 3D.
+        val spin = (SystemClock.uptimeMillis() % 7000L) / 7000f * TWO_PI_F
+        drawPistolPreview(canvas, panelLeft + bw * 0.76f, panelTop + panelH * 0.50f, panelH * 0.066f, spin, 0.3f)
     }
 
     /** Menu de configurações: título, duas abas (Mão e Menu) e cartões para escolher. */
@@ -2933,6 +3026,8 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val GAMES_ICON = 2     // o ícone azul abre a lista de jogos
         const val SHOOT_MENU = 4     // jogo de tiro (teste)
         const val GUN_ON_FRAMES = 3  // quadros com a mão fechada para a pistola aparecer
+        const val GUN_MAX_QUADS = 400 // faces da pistola 3D
+        const val GUN_Z_GAIN = 1.0f   // quanto confiar na profundidade (z) dos pontos da mão
         const val GUN_OFF_FRAMES = 4 // quadros com a mão aberta para a pistola sumir
         const val GAME_ICON = 3      // o ícone amarelo abre o jogo de empilhar blocos
 
