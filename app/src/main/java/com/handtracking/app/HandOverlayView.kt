@@ -45,8 +45,8 @@ import kotlin.math.sqrt
  *    (pinça rápida = clique, pinça e arrastar = rolar).
  *  - Menu verde: configurações, em duas abas. "Mão": estilo da mão (normal ou Meta Quest).
  *    "Menu": formato da barra (horizontal, em arco ou vertical). As escolhas ficam salvas no aparelho.
- *  - Menu azul ("Jogos"): abre jogos instalados no celular (APK), como o Gorilla MR. O app acha o jogo pelo
- *    nome na lista de apps do celular, então não precisa copiar nada do jogo para dentro deste app.
+ *  - Menu azul ("Jogos"): lista dos jogos (Blocos e Tiro). A lista também sabe abrir jogos instalados no celular
+ *    (APK) pelo nome, se algum for acrescentado em appGameNames.
  *  - Jogo "Tiro" (teste), pela lista de Jogos: ao fechar a mão toda, aparece uma pistola feita de blocos na
  *    sua mão (passo 1: só segurar; atirar vem depois). A pistola é um modelo 3D: ela gira junto com a mão (a
  *    orientação da mão em 3D vem dos pontos x, y e z do MediaPipe). Com a mão fechada ela não conta como pinça.
@@ -271,13 +271,14 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
     // ---- App "Jogos": abre jogos (APK) que já estão instalados no celular ----
     private val appCtx: Context = context
-    private val appGameNames = arrayOf("Blocos", "Tiro", "Gorilla MR")        // nome mostrado
-    private val appGameBuiltIn = booleanArrayOf(true, true, false)            // true = jogo do próprio app (abre aqui dentro)
-    private val appGameMenu = intArrayOf(GAME_ICON, SHOOT_MENU, NONE)         // menu que o jogo do app abre
-    private val appGameKeys = arrayOf(                                        // jeitos de o nome aparecer no celular
+    // Para pôr um jogo novo: acrescente o nome aqui, true se for do próprio app (e o menu que ele abre) ou false
+    // se for um APK instalado no celular (e pedaços do nome dele em appGameKeys).
+    private val appGameNames = arrayOf("Blocos", "Tiro")                       // nome mostrado
+    private val appGameBuiltIn = booleanArrayOf(true, true)                   // true = jogo do próprio app (abre aqui dentro)
+    private val appGameMenu = intArrayOf(GAME_ICON, SHOOT_MENU)               // menu que o jogo do app abre
+    private val appGameKeys = arrayOf(                                        // jeitos de o nome aparecer no celular (só para APKs)
         emptyArray<String>(),
-        emptyArray<String>(),
-        arrayOf("gorilla mr", "gorillamr", "gorilla_mr", "gorilla-mr")
+        emptyArray<String>()
     )
     private val appGameIntent = arrayOfNulls<Intent>(appGameNames.size)       // como abrir (null = não instalado)
     private val tileL = FloatArray(3)
@@ -870,6 +871,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
     /** Procura, entre os apps instalados, os jogos da lista (pelo nome que aparece no celular). */
     private fun scanGames() {
+        if (appGameBuiltIn.all { it }) return      // só jogos do próprio app: nada para procurar no celular
         try {
             val pm = appCtx.packageManager
             val main = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
