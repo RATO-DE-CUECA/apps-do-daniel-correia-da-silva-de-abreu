@@ -25,8 +25,10 @@ import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.hypot
+import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sign
 import kotlin.math.sin
 import kotlin.math.sqrt
 
@@ -56,6 +58,10 @@ import kotlin.math.sqrt
  *    até onde quer (a marca amarela na mesa mostra onde ele vai cair); solta para cair. Para ver a mesa
  *    de outros lados: vire a cabeça (a mesa "gira" junto) ou faça pinça na mesa e arraste. O botão
  *    redondo no canto reinicia.
+ *  - Profundidade: pinça na barrinha branca (da barra ou de um menu) e EMPURRAR a mão para longe da câmera
+ *    afasta o menu (ele fica menor); PUXAR a mão para perto aproxima (ele fica maior). Tudo cresce ou encolhe
+ *    em volta da barra. No VR Box cada olho vê o menu um pouco deslocado, o que dá a sensação 3D.
+ *    O botão "Centralizar" também volta a distância ao normal.
  * No modo VR Box também desenha a imagem da câmera e repete tudo para os dois olhos.
  *
  * Modo 3D ("mundo"): com a câmera traseira e o giroscópio, a barra e os menus ficam parados
@@ -442,6 +448,53 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     }
     private val arrowPath = Path()
 
+    // ---- Profundidade: afastar/aproximar o menu (pinça na barrinha + empurrar/puxar a mão) ----
+    // depthZ = distância do menu (1 = normal, menor = mais perto e maior, maior = mais longe e menor).
+    // Tudo (barra + menus abertos) cresce ou encolhe em volta do centro da barra.
+    private var depthZ = 1f
+    private var depthTarget = 1f
+    private var depthSettling = false
+    private var depthGrabZ = 1f
+    private var depthGrabSize = 0f
+    private var depthSmoothRatio = 1f
+    private var depthShowUntil = 0L
+    private var dScale = 1f                       // 1 / depthZ: escala do menu na tela
+    private var pvX = 0f                          // centro da escala (centro da barra, preso à imagem)
+    private var pvY = 0f
+    private val pinchSX = FloatArray(MAX_HANDS)   // pinça na tela (sem a escala do menu)
+    private val pinchSY = FloatArray(MAX_HANDS)
+    private val pinchSize = FloatArray(MAX_HANDS) // tamanho da mão que faz a pinça (palma, em pixels)
+    private val depthPaint = Paint().apply {
+        color = Color.WHITE
+        isAntiAlias = true
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+        setShadowLayer(4f, 0f, 2f, Color.argb(150, 0, 0, 0))
+    }
+
+    /** Calcula a escala do menu e o centro dela (centro da barra, limitado à imagem). */
+    private fun updateDepthPivot(iw: Float, ih: Float) {
+        dScale = 1f / depthZ
+        pvX = barCX.coerceIn(0f, iw)
+        pvY = barCY.coerceIn(0f, ih)
+    }
+    /** Ponto da tela -> ponto do "espaço do menu" (onde ficam os ícones e as janelas). */
+    private fun layoutX(sx: Float): Float = pvX + (sx - pvX) / dScale
+    private fun layoutY(sy: Float): Float = pvY + (sy - pvY) / dScale
+    /** Ponto do "espaço do menu" -> ponto na tela. */
+    private fun screenX(lx: Float): Float = pvX + (lx - pvX) * dScale
+    private fun screenY(ly: Float): Float = pvY + (ly - pvY) * dScale
+
+    /** Empurrar a mão (palma menor) afasta o menu; puxar (palma maior) aproxima. */
+    private fun updateDepthFromHand(size: Float) {
+        if (depthGrabSize <= 1f || size <= 1f) return
+        depthSmoothRatio += (size / depthGrabSize - depthSmoothRatio) * DEPTH_HAND_SMOOTH
+        val l = ln(depthSmoothRatio)
+        val l2 = if (abs(l) < DEPTH_DEAD) 0f else l - DEPTH_DEAD * sign(l)
+        depthTarget = (depthGrabZ * exp(-l2 * DEPTH_GAIN)).coerceIn(DEPTH_MIN_Z, DEPTH_MAX_Z)
+        depthShowUntil = SystemClock.uptimeMillis() + DEPTH_LABEL_MS
+    }
+
     // ---- Modo 3D ("mundo"): a barra e os menus ficam parados no espaço, usando o giroscópio ----
     /** true = usa o giroscópio (só com a câmera traseira). false = tudo preso na tela, como antes. */
     @Volatile var worldMode: Boolean = false
@@ -537,6 +590,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     /** Traz a barra de volta para a frente de você (e os menus voltam a acompanhar a barra). */
     fun recenter() {
         anchorsPending = true
+        depthTarget = 1f
         postInvalidate()
     }
 
@@ -601,11 +655,12 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         // Com o jogo aberto, a barra e o menu ficam presos à tela (a mesa gira com a cabeça, eles não).
         worldActive = worldMode && rot != null && !isGameOpen()
         updateScene(iw, ih)
+        updateDepthPivot(iw, ih)
 
         if (vrMode) {
             val half = width / 2f
-            drawRegion(canvas, 0f, half, height.toFloat(), bmp, iw, ih)     // olho esquerdo
-            drawRegion(canvas, half, half, height.toFloat(), bmp, iw, ih)   // olho direito
+            drawRegion(canvas, 0f, half, height.toFloat(), bmp, iw, ih, 1f)     // olho esquerdo
+            drawRegion(canvas, half, half, height.toFloat(), bmp, iw, ih, -1f)   // olho direito
             canvas.drawLine(half, 0f, half, height.toFloat(), dividerPaint)
         } else {
             drawRegion(canvas, 0f, width.toFloat(), height.toFloat(), null, iw, ih)
@@ -614,7 +669,9 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         notifyWebPanel(iw, ih)
 
         // O jogo precisa redesenhar sempre (os blocos caem sozinhos).
-        if (isGameOpen() || animating || openMenu == SHOOT_MENU) postInvalidateOnAnimation()
+        if (isGameOpen() || animating || openMenu == SHOOT_MENU || depthSettling ||
+            SystemClock.uptimeMillis() < depthShowUntil
+        ) postInvalidateOnAnimation()
     }
 
     /** O menu verde é o das configurações. */
@@ -641,7 +698,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 (py - panelTop) / panelH * WebTexture.HEIGHT
             )
         } else {
-            onWebTouch?.invoke(action, (px - panelLeft) * touchScale, (py - panelTop) * touchScale)
+            onWebTouch?.invoke(action, (px - panelLeft) * touchScale * dScale, (py - panelTop) * touchScale * dScale)
         }
     }
 
@@ -656,13 +713,14 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         val scale = min(width / iw, height / ih)
         val offsetX = (width - iw * scale) / 2f
         val offsetY = (height - ih * scale) / 2f
+        val ds = dScale
         cb(
             true,
-            offsetX + panelLeft * scale,
-            offsetY + panelTop * scale,
-            panelW * scale,
-            panelH * scale,
-            panelCorner * scale
+            offsetX + screenX(panelLeft) * scale,
+            offsetY + screenY(panelTop) * scale,
+            panelW * ds * scale,
+            panelH * ds * scale,
+            panelCorner * ds * scale
         )
     }
 
@@ -1024,7 +1082,17 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             panelMoved.fill(false)
             anchorsPending = false
         }
+        // Distância do menu: anda suave até o alvo.
+        val dd = depthTarget - depthZ
+        if (abs(dd) > 0.002f) {
+            depthZ += dd * DEPTH_EASE
+            depthSettling = true
+        } else {
+            depthZ = depthTarget
+            depthSettling = false
+        }
         applyGeometry(iw, ih)
+        updateDepthPivot(iw, ih)
 
         for (i in 0 until ICON_SHOWN) iconTouch[i] = false
         for (b in 0 until GAME_BLOCKS) gTouch[b] = false
@@ -1063,8 +1131,10 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 if (hIdx < MAX_HANDS && gunOn[hIdx]) continue
 
                 // Dedo indicador encostando?
-                val fx = hand[INDEX_TIP].x() * iw
-                val fy = hand[INDEX_TIP].y() * ih
+                val rawFx = hand[INDEX_TIP].x() * iw
+                val rawFy = hand[INDEX_TIP].y() * ih
+                val fx = layoutX(rawFx)
+                val fy = layoutY(rawFy)
                 for (i in 0 until ICON_SHOWN) {
                     if (abs(fx - iconCX[i]) <= iconS * 0.55f && abs(fy - iconCY[i]) <= iconS * 0.55f) {
                         iconTouch[i] = true
@@ -1113,12 +1183,15 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     (hand[WRIST].y() - hand[MIDDLE_MCP].y()) * ih
                 )
                 if (handSize > 1f && pinchCount < MAX_HANDS) {
-                    val ratio = hypot(tx - fx, ty - fy) / handSize
+                    val ratio = hypot(tx - rawFx, ty - rawFy) / handSize
                     // Histerese: precisa fechar mais para pegar do que para soltar.
                     val limit = if (grabbed != NONE) PINCH_RELEASE else PINCH_START
                     if (ratio < limit) {
-                        pinchX[pinchCount] = (tx + fx) / 2f
-                        pinchY[pinchCount] = (ty + fy) / 2f
+                        pinchSX[pinchCount] = (tx + rawFx) / 2f
+                        pinchSY[pinchCount] = (ty + rawFy) / 2f
+                        pinchSize[pinchCount] = handSize
+                        pinchX[pinchCount] = layoutX(pinchSX[pinchCount])
+                        pinchY[pinchCount] = layoutY(pinchSY[pinchCount])
                         pinchCount++
                     }
                 }
@@ -1295,12 +1368,18 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 tapCancelled = false
                 when (best) {
                     HANDLE -> {
-                        grabOffsetX = barCX - pinchX[bestIdx]
-                        grabOffsetY = barCY - pinchY[bestIdx]
+                        grabOffsetX = barCX - pinchSX[bestIdx]
+                        grabOffsetY = barCY - pinchSY[bestIdx]
+                        depthGrabZ = depthTarget
+                        depthGrabSize = pinchSize[bestIdx]
+                        depthSmoothRatio = 1f
                     }
                     PANEL_HANDLE -> {
-                        grabOffsetX = panelLeft + panelW / 2f - pinchX[bestIdx]
-                        grabOffsetY = panelTop + panelH / 2f - pinchY[bestIdx]
+                        grabOffsetX = screenX(panelLeft + panelW / 2f) - pinchSX[bestIdx]
+                        grabOffsetY = screenY(panelTop + panelH / 2f) - pinchSY[bestIdx]
+                        depthGrabZ = depthTarget
+                        depthGrabSize = pinchSize[bestIdx]
+                        depthSmoothRatio = 1f
                     }
                     GAME_BLOCK -> {
                         val b = gameHeld
@@ -1413,8 +1492,8 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                         expectedY = barCY - grabOffsetY
                     }
                     PANEL_HANDLE -> {
-                        expectedX = panelLeft + panelW / 2f - grabOffsetX
-                        expectedY = panelTop + panelH / 2f - grabOffsetY
+                        expectedX = screenX(panelLeft + panelW / 2f) - grabOffsetX
+                        expectedY = screenY(panelTop + panelH / 2f) - grabOffsetY
                     }
                     PANEL_CONTENT -> {
                         expectedX = lastWebPX
@@ -1431,15 +1510,18 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 }
                 var idx = 0
                 var bestDist = Float.MAX_VALUE
+                val onScreen = grabbed == HANDLE || grabbed == PANEL_HANDLE
                 for (p in 0 until pinchCount) {
-                    val d = hypot(pinchX[p] - expectedX, pinchY[p] - expectedY)
+                    val d = if (onScreen) hypot(pinchSX[p] - expectedX, pinchSY[p] - expectedY)
+                            else hypot(pinchX[p] - expectedX, pinchY[p] - expectedY)
                     if (d < bestDist) { bestDist = d; idx = p }
                 }
 
                 when (grabbed) {
                     HANDLE -> {
-                        val cx = pinchX[idx] + grabOffsetX
-                        val cy = pinchY[idx] + grabOffsetY
+                        updateDepthFromHand(pinchSize[idx])
+                        val cx = pinchSX[idx] + grabOffsetX
+                        val cy = pinchSY[idx] + grabOffsetY
                         if (worldActive) {
                             unproject(cx, cy, iw, ih, barDir)
                         } else {
@@ -1451,8 +1533,9 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     PANEL_HANDLE -> {
                         val m = openMenu
                         if (m != NONE) {
-                            val cx = pinchX[idx] + grabOffsetX
-                            val cy = pinchY[idx] + grabOffsetY
+                            updateDepthFromHand(pinchSize[idx])
+                            val cx = layoutX(pinchSX[idx] + grabOffsetX)
+                            val cy = layoutY(pinchSY[idx] + grabOffsetY)
                             panelMoved[m] = true
                             if (worldActive) {
                                 unproject(cx, cy, iw, ih, panelDir[m])
@@ -2559,7 +2642,8 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         regionHeight: Float,
         bmp: Bitmap?,
         iw: Float,
-        ih: Float
+        ih: Float,
+        eye: Float = 0f
     ) {
         // Mesma regra de encaixe do PreviewView (FIT_CENTER), dentro da região.
         val scale = min(regionWidth / iw, regionHeight / ih)
@@ -2575,6 +2659,12 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             canvas.save()
             canvas.translate(offsetX, offsetY)
             canvas.scale(scale, scale)
+            // Profundidade: o menu encolhe/cresce em volta da barra; no VR Box cada olho vê o menu um pouco
+            // deslocado (perto = olho esquerdo para a direita, longe = para a esquerda), o que dá a sensação 3D.
+            canvas.translate(DEPTH_PARALLAX * iw * (dScale - 1f) * eye, 0f)
+            canvas.translate(pvX, pvY)
+            canvas.scale(dScale, dScale)
+            canvas.translate(-pvX, -pvY)
             drawPanel(canvas)
             val homeTilt = menuLayout == LAYOUT_GRID && beginTilt(canvas, barLeft, barTop, barLeft + barW, barTop + barH)
             drawBar(canvas)
@@ -2586,6 +2676,11 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 canvas.drawCircle(pinchX[p], pinchY[p], max(iconS * 0.25f, 8f), pinchPaint)
             }
             canvas.restore()
+            if (SystemClock.uptimeMillis() < depthShowUntil) {
+                depthPaint.textSize = ih * scale * 0.06f
+                val label = "Distância: " + String.format("%.1f", depthZ).replace('.', ',') + " m"
+                canvas.drawText(label, offsetX + iw * scale / 2f, offsetY + ih * scale * 0.1f, depthPaint)
+            }
         }
 
         val res = result ?: return
@@ -3062,6 +3157,16 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
         const val TAN_HALF_FOV = 0.6494f   // tan(33 graus): câmera com ~66 graus no lado maior da imagem
         const val OFFSCREEN = 100000f      // "bem longe da tela"
+
+        // Profundidade do menu (afastar/aproximar com a pinça na barrinha).
+        const val DEPTH_MIN_Z = 0.6f       // mais perto (menu ~1,7x maior)
+        const val DEPTH_MAX_Z = 2.2f       // mais longe (menu ~0,45x)
+        const val DEPTH_GAIN = 1.5f        // sensibilidade ao empurrar/puxar a mão (maior = muda mais rápido)
+        const val DEPTH_DEAD = 0.05f       // zona morta: pequenas variações do tamanho da mão não contam
+        const val DEPTH_HAND_SMOOTH = 0.3f // suaviza o tamanho da mão (tremida do hand tracking)
+        const val DEPTH_EASE = 0.4f        // o menu anda suave até a nova distância
+        const val DEPTH_PARALLAX = 0.02f   // efeito 3D no VR Box (fração da largura; 0 = desliga)
+        const val DEPTH_LABEL_MS = 900L    // quanto tempo o texto "Distância" fica na tela
 
         const val ICON_COUNT = 5     // menus: 0 a 2 têm ícone; 3 (Blocos) e 4 (Tiro) abrem pela lista de Jogos
         const val ICON_SHOWN = 3     // ícones que aparecem na janela (o jogo de blocos abre pela lista de Jogos)
