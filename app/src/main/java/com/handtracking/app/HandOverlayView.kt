@@ -241,6 +241,12 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     // ---- Jogo de tiro (teste): pistola de blocos na mão fechada ----
     private val gunOn = BooleanArray(MAX_HANDS)         // mão fechada segurando a pistola
     private val gunCnt = IntArray(MAX_HANDS)            // contador para não piscar (histerese)
+    // Pequena tolerância para falhas momentâneas do rastreamento (não usar dados antigos para interação).
+    private val lastHandSeenMs = LongArray(MAX_HANDS)
+    private val cachedLandmarks = Array(MAX_HANDS) { FloatArray(42) }
+    private val cachedLandmarkTimeMs = LongArray(MAX_HANDS)
+    private var cachedHandCount = 0
+    private val handLossGraceMs = 180L
     private val gunX = FloatArray(MAX_HANDS)            // centro da palma, em pixels da imagem (suavizado)
     private val gunY = FloatArray(MAX_HANDS)
     private val gunAX = FloatArray(MAX_HANDS)           // para onde aponta o cano (pulso -> nó do dedo médio), em 3D
@@ -462,6 +468,20 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         result = newResult
         imageWidth = width
         imageHeight = height
+        val now = SystemClock.uptimeMillis()
+        val hands = newResult?.landmarks() ?: emptyList()
+        cachedHandCount = min(hands.size, MAX_HANDS)
+        for (h in 0 until cachedHandCount) {
+            val landmarks = hands[h]
+            if (landmarks.size >= 21) {
+                for (k in 0 until 21) {
+                    cachedLandmarks[h][k * 2] = landmarks[k].x()
+                    cachedLandmarks[h][k * 2 + 1] = landmarks[k].y()
+                }
+                cachedLandmarkTimeMs[h] = now
+                lastHandSeenMs[h] = now
+            }
+        }
         postInvalidate()
     }
 
@@ -1120,9 +1140,13 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 }
             }
         }
+        val nowMs = SystemClock.uptimeMillis()
         for (h in seenHands until MAX_HANDS) {
-            gunOn[h] = false
-            gunCnt[h] = 0
+            // O MediaPipe pode perder a mão por poucos frames; só encerra o estado após a tolerância.
+            if (lastHandSeenMs[h] == 0L || nowMs - lastHandSeenMs[h] > handLossGraceMs) {
+                gunOn[h] = false
+                gunCnt[h] = 0
+            }
         }
 
         if ((grabbed == GAME_BLOCK || grabbed == GAME_RESET || grabbed == GAME_ORBIT) &&
@@ -2525,16 +2549,29 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             canvas.restore()
         }
 
-        val res = result ?: return
-        var handIdx = 0
-        for (hand in res.landmarks()) {
-            val myIdx = handIdx++
-            if (hand.size < 21) continue
+        val res = result
+        val currentHands = res?.landmarks() ?: emptyList()
+        val nowMs = SystemClock.uptimeMillis()
+        val drawn = BooleanArray(MAX_HANDS)
+        for ((myIdx, hand) in currentHands.withIndex()) {
+            if (myIdx >= MAX_HANDS || hand.size < 21) continue
+            drawn[myIdx] = true
             for (k in 0 until 21) {
                 lmX[k] = hand[k].x() * iw * scale + offsetX
                 lmY[k] = hand[k].y() * ih * scale + offsetY
             }
-            if (openMenu == SHOOT_MENU && myIdx < MAX_HANDS && gunOn[myIdx]) drawPistol(canvas, myIdx, scale, offsetX, offsetY)
+            if (openMenu == SHOOT_MENU && gunOn[myIdx]) drawPistol(canvas, myIdx, scale, offsetX, offsetY)
+            if (handStyle == STYLE_QUEST) drawQuestHand(canvas) else drawNormalHand(canvas)
+        }
+        // Se a detecção falhar por um instante, mantém o último desenho por no máximo 180 ms.
+        // A mão congelada é apenas visual: não participa das interações enquanto não for detectada.
+        for (h in 0 until MAX_HANDS) {
+            if (drawn[h] || cachedLandmarkTimeMs[h] == 0L || nowMs - cachedLandmarkTimeMs[h] > handLossGraceMs) continue
+            for (k in 0 until 21) {
+                lmX[k] = cachedLandmarks[h][k * 2] * iw * scale + offsetX
+                lmY[k] = cachedLandmarks[h][k * 2 + 1] * ih * scale + offsetY
+            }
+            if (openMenu == SHOOT_MENU && gunOn[h]) drawPistol(canvas, h, scale, offsetX, offsetY)
             if (handStyle == STYLE_QUEST) drawQuestHand(canvas) else drawNormalHand(canvas)
         }
     }
