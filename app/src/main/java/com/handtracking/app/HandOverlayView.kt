@@ -241,12 +241,6 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     // ---- Jogo de tiro (teste): pistola de blocos na mão fechada ----
     private val gunOn = BooleanArray(MAX_HANDS)         // mão fechada segurando a pistola
     private val gunCnt = IntArray(MAX_HANDS)            // contador para não piscar (histerese)
-    // Pequena tolerância para falhas momentâneas do rastreamento (não usar dados antigos para interação).
-    private val lastHandSeenMs = LongArray(MAX_HANDS)
-    private val cachedLandmarks = Array(MAX_HANDS) { FloatArray(42) }
-    private val cachedLandmarkTimeMs = LongArray(MAX_HANDS)
-    private var cachedHandCount = 0
-    private val handLossGraceMs = 180L
     private val gunX = FloatArray(MAX_HANDS)            // centro da palma, em pixels da imagem (suavizado)
     private val gunY = FloatArray(MAX_HANDS)
     private val gunAX = FloatArray(MAX_HANDS)           // para onde aponta o cano (pulso -> nó do dedo médio), em 3D
@@ -255,7 +249,11 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     private val gunBX = FloatArray(MAX_HANDS)           // "para cima" da pistola (lado do polegar), em 3D
     private val gunBY = FloatArray(MAX_HANDS)
     private val gunBZ = FloatArray(MAX_HANDS)
-    private val gunHS = FloatArray(MAX_HANDS)           // tamanho da mão em 3D (pulso até o nó do dedo médio)
+    private val gunHS = FloatArray(MAX_HANDS)           // tamanho da palma da mão em pixels (estimado, estável)
+    private val gunSa = FloatArray(MAX_HANDS) { 1f }    // cano aponta para longe (+1) ou para a câmera (-1)
+    private val gunSb = FloatArray(MAX_HANDS) { 1f }    // lado de cima da pistola vira para longe (+1) ou para a câmera (-1)
+    private val gunFa = IntArray(MAX_HANDS)             // quadros seguidos contrariando o sinal do cano
+    private val gunFb = IntArray(MAX_HANDS)
     private val gunTmpX = FloatArray(21)
     private val gunTmpY = FloatArray(21)
     private val gunTmpZ = FloatArray(21)
@@ -468,20 +466,6 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         result = newResult
         imageWidth = width
         imageHeight = height
-        val now = SystemClock.uptimeMillis()
-        val hands = newResult?.landmarks() ?: emptyList()
-        cachedHandCount = min(hands.size, MAX_HANDS)
-        for (h in 0 until cachedHandCount) {
-            val landmarks = hands[h]
-            if (landmarks.size >= 21) {
-                for (k in 0 until 21) {
-                    cachedLandmarks[h][k * 2] = landmarks[k].x()
-                    cachedLandmarks[h][k * 2 + 1] = landmarks[k].y()
-                }
-                cachedLandmarkTimeMs[h] = now
-                lastHandSeenMs[h] = now
-            }
-        }
         postInvalidate()
     }
 
@@ -1140,13 +1124,9 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 }
             }
         }
-        val nowMs = SystemClock.uptimeMillis()
         for (h in seenHands until MAX_HANDS) {
-            // O MediaPipe pode perder a mão por poucos frames; só encerra o estado após a tolerância.
-            if (lastHandSeenMs[h] == 0L || nowMs - lastHandSeenMs[h] > handLossGraceMs) {
-                gunOn[h] = false
-                gunCnt[h] = 0
-            }
+            gunOn[h] = false
+            gunCnt[h] = 0
         }
 
         if ((grabbed == GAME_BLOCK || grabbed == GAME_RESET || grabbed == GAME_ORBIT) &&
@@ -2142,26 +2122,52 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     }
 
     /**
-     * Vê se a mão está totalmente fechada (as pontas dos 4 dedos ficam perto do pulso) e guarda onde e
-     * para que lado a pistola deve ficar, em 3D. xs/ys/zs: os 21 pontos da mão (x e y em pixels da imagem).
+     * Vê se a mão está totalmente fechada e guarda onde e para que lado a pistola deve ficar, em 3D.
+     * xs/ys/zs: os 21 pontos da mão (x e y em pixels da imagem; z na mesma escala, negativo = mais perto).
+     *
+     * A profundidade (z) do MediaPipe é a parte menos confiável. Por isso o giro da pistola vem sobretudo do que
+     * aparece na tela: quanto o eixo do cano ou a linha dos nós dos dedos encurtam (a "perspectiva") diz o quanto
+     * eles apontam para dentro ou para fora da tela. O z só decide o SINAL (para longe ou para perto), e só
+     * muda com evidência forte e repetida. Assim, apontar o punho para a frente não faz a pistola tremer.
      */
     private fun updateGunHand(h: Int, xs: FloatArray, ys: FloatArray, zs: FloatArray) {
-        val hs2 = hypot(xs[WRIST] - xs[MIDDLE_MCP], ys[WRIST] - ys[MIDDLE_MCP])
-        if (hs2 < 8f) {
+        // Medidas na tela: eixo da palma (pulso -> nó do médio) e linha dos nós dos dedos (mindinho -> indicador).
+        val lx = xs[MIDDLE_MCP] - xs[WRIST]
+        val ly = ys[MIDDLE_MCP] - ys[WRIST]
+        val wx = xs[5] - xs[17]
+        val wy = ys[5] - ys[17]
+        val l2 = hypot(lx, ly)
+        val w2 = hypot(wx, wy)
+        // Tamanho verdadeiro da palma em pixels: o maior entre o comprimento e a largura corrigida. Sobe rápido
+        // e desce devagar, então não encolhe quando a mão aponta para a câmera.
+        val tNow = max(l2, w2 * 1.3f)
+        val wasOn = gunOn[h]
+        if (tNow < 8f) {
             gunOn[h] = false
             gunCnt[h] = 0
             return
         }
-        // Dedo dobrado = a ponta está quase tão perto do pulso quanto a base do dedo.
+        if (!wasOn || gunHS[h] <= 0f) {
+            gunHS[h] = tNow
+        } else {
+            gunHS[h] += (tNow - gunHS[h]) * (if (tNow > gunHS[h]) 0.6f else 0.03f)
+        }
+        val t = gunHS[h]
+
+        // Palma fechada: as 4 pontas dos dedos perto do centro da palma (e na mesma profundidade do nó do dedo).
+        val ox = (xs[0] + xs[5] + xs[9] + xs[13] + xs[17]) / 5f
+        val oy = (ys[0] + ys[5] + ys[9] + ys[13] + ys[17]) / 5f
         var curled = 0
+        var dzSum = 0f
         for (f in 1..4) {
             val mcp = 1 + f * 4
             val tip = mcp + 3
-            val dm = hypot(xs[mcp] - xs[WRIST], ys[mcp] - ys[WRIST])
-            val dt = hypot(xs[tip] - xs[WRIST], ys[tip] - ys[WRIST])
-            if (dt < dm * 1.30f) curled++
+            if (hypot(xs[tip] - ox, ys[tip] - oy) / t < 0.78f) curled++
+            dzSum += zs[tip] - zs[mcp]
         }
-        val fist = curled >= 4
+        // Dedos esticados para a câmera (ou para longe) também ficam "perto" da palma na imagem. A diferença de
+        // profundidade média entre as pontas e os nós separa os dois casos, mesmo com o z um pouco ruidoso.
+        val fist = curled >= 4 && abs(dzSum / 4f) / t < 0.5f
         if (fist) {
             if (gunCnt[h] < 0) gunCnt[h] = 0
             gunCnt[h] = min(gunCnt[h] + 1, 20)
@@ -2169,43 +2175,77 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             if (gunCnt[h] > 0) gunCnt[h] = 0
             gunCnt[h] = max(gunCnt[h] - 1, -20)
         }
-        val wasOn = gunOn[h]
         if (gunCnt[h] >= GUN_ON_FRAMES) gunOn[h] = true else if (gunCnt[h] <= -GUN_OFF_FRAMES) gunOn[h] = false
 
-        // Centro da palma.
-        val ox = (xs[0] + xs[5] + xs[9] + xs[13] + xs[17]) / 5f
-        val oy = (ys[0] + ys[5] + ys[9] + ys[13] + ys[17]) / 5f
-        // Eixo do cano: do pulso para o nó do dedo médio (em 3D).
-        var ax = xs[MIDDLE_MCP] - xs[WRIST]
-        var ay = ys[MIDDLE_MCP] - ys[WRIST]
-        var az = (zs[MIDDLE_MCP] - zs[WRIST]) * GUN_Z_GAIN
+        // Sinais (para longe ou para perto da câmera), com histerese.
+        val dza = zs[MIDDLE_MCP] - zs[WRIST]
+        val dzb = zs[5] - zs[17]
+        if (!wasOn) {
+            gunSa[h] = if (dza < -0.2f * t) -1f else 1f
+            gunSb[h] = if (dzb < -0.1f * t) -1f else 1f
+            gunFa[h] = 0
+            gunFb[h] = 0
+        } else {
+            if (gunSa[h] > 0f) {
+                if (dza < -0.30f * t) gunFa[h]++ else gunFa[h] = 0
+                if (gunFa[h] >= 3) { gunSa[h] = -1f; gunFa[h] = 0 }
+            } else {
+                if (dza > 0.12f * t) gunFa[h]++ else gunFa[h] = 0
+                if (gunFa[h] >= 3) { gunSa[h] = 1f; gunFa[h] = 0 }
+            }
+            if (gunSb[h] > 0f) {
+                if (dzb < -0.20f * t) gunFb[h]++ else gunFb[h] = 0
+                if (gunFb[h] >= 3) { gunSb[h] = -1f; gunFb[h] = 0 }
+            } else {
+                if (dzb > 0.20f * t) gunFb[h]++ else gunFb[h] = 0
+                if (gunFb[h] >= 3) { gunSb[h] = 1f; gunFb[h] = 0 }
+            }
+        }
+
+        // Eixo do cano: a parte que aparece na tela vem da imagem; a parte de profundidade, da "perspectiva".
+        // Folga de 10%: mãos têm proporções diferentes, e um eixo quase de frente para a tela não deve inclinar à toa.
+        val aXY = min(1f, (l2 / t) / 0.9f)
+        var ax = 0f
+        var ay = 0f
+        if (l2 > 1e-3f) {
+            ax = lx / l2 * aXY
+            ay = ly / l2 * aXY
+        }
+        val az = gunSa[h] * sqrt(max(0f, 1f - aXY * aXY))
+        // Eixo "para cima" da pistola (lado do polegar), do mesmo jeito.
+        val bXY = min(1f, (w2 * 1.3f / t) / 0.9f)
+        var bx = 0f
+        var by = 0f
+        if (w2 > 1e-3f) {
+            bx = wx / w2 * bXY
+            by = wy / w2 * bXY
+        }
+        var bz = gunSb[h] * sqrt(max(0f, 1f - bXY * bXY))
+        // Os dois eixos precisam ficar em ângulo reto.
         val an = sqrt(ax * ax + ay * ay + az * az)
-        if (an < 1e-3f) return
         ax /= an
         ay /= an
-        az /= an
-        // Eixo "para cima": de um lado a outro da palma (mindinho -> indicador), sem a parte que já é do cano.
-        var bx = xs[5] - xs[17]
-        var by = ys[5] - ys[17]
-        var bz = (zs[5] - zs[17]) * GUN_Z_GAIN
-        val pr = bx * ax + by * ay + bz * az
+        val azn = az / an
+        val pr = bx * ax + by * ay + bz * azn
         bx -= pr * ax
         by -= pr * ay
-        bz -= pr * az
+        bz -= pr * azn
         val bn = sqrt(bx * bx + by * by + bz * bz)
-        if (bn < 1e-3f) return
-        bx /= bn
-        by /= bn
-        bz /= bn
+        val haveB = bn > 1e-3f
+        if (haveB) {
+            bx /= bn
+            by /= bn
+            bz /= bn
+        }
 
-        // Suaviza (sem suavizar enquanto a pistola ainda não está na mão, para ela já nascer no lugar certo).
-        val k = if (wasOn) 0.5f else 1f
-        gunX[h] += (ox - gunX[h]) * k
-        gunY[h] += (oy - gunY[h]) * k
-        gunHS[h] += (an - gunHS[h]) * k
+        // Suaviza. Quando o eixo está muito de ponta para a câmera, o que se vê é pouco e mais instável: suaviza mais.
+        var k = if (wasOn) 0.5f else 1f
+        if (aXY < 0.35f || bXY < 0.35f) k *= 0.5f
+        gunX[h] += (ox - gunX[h]) * (if (wasOn) 0.5f else 1f)
+        gunY[h] += (oy - gunY[h]) * (if (wasOn) 0.5f else 1f)
         var sax = gunAX[h] + (ax - gunAX[h]) * k
         var say = gunAY[h] + (ay - gunAY[h]) * k
-        var saz = gunAZ[h] + (az - gunAZ[h]) * k
+        var saz = gunAZ[h] + (azn - gunAZ[h]) * k
         val sn = sqrt(sax * sax + say * say + saz * saz)
         if (sn > 1e-4f) {
             sax /= sn
@@ -2214,12 +2254,11 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         } else {
             sax = ax
             say = ay
-            saz = az
+            saz = azn
         }
-        var sbx = gunBX[h] + (bx - gunBX[h]) * k
-        var sby = gunBY[h] + (by - gunBY[h]) * k
-        var sbz = gunBZ[h] + (bz - gunBZ[h]) * k
-        // Mantém os dois eixos em ângulo reto.
+        var sbx = if (haveB) gunBX[h] + (bx - gunBX[h]) * k else gunBX[h]
+        var sby = if (haveB) gunBY[h] + (by - gunBY[h]) * k else gunBY[h]
+        var sbz = if (haveB) gunBZ[h] + (bz - gunBZ[h]) * k else gunBZ[h]
         val d = sbx * sax + sby * say + sbz * saz
         sbx -= d * sax
         sby -= d * say
@@ -2549,29 +2588,16 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             canvas.restore()
         }
 
-        val res = result
-        val currentHands = res?.landmarks() ?: emptyList()
-        val nowMs = SystemClock.uptimeMillis()
-        val drawn = BooleanArray(MAX_HANDS)
-        for ((myIdx, hand) in currentHands.withIndex()) {
-            if (myIdx >= MAX_HANDS || hand.size < 21) continue
-            drawn[myIdx] = true
+        val res = result ?: return
+        var handIdx = 0
+        for (hand in res.landmarks()) {
+            val myIdx = handIdx++
+            if (hand.size < 21) continue
             for (k in 0 until 21) {
                 lmX[k] = hand[k].x() * iw * scale + offsetX
                 lmY[k] = hand[k].y() * ih * scale + offsetY
             }
-            if (openMenu == SHOOT_MENU && gunOn[myIdx]) drawPistol(canvas, myIdx, scale, offsetX, offsetY)
-            if (handStyle == STYLE_QUEST) drawQuestHand(canvas) else drawNormalHand(canvas)
-        }
-        // Se a detecção falhar por um instante, mantém o último desenho por no máximo 180 ms.
-        // A mão congelada é apenas visual: não participa das interações enquanto não for detectada.
-        for (h in 0 until MAX_HANDS) {
-            if (drawn[h] || cachedLandmarkTimeMs[h] == 0L || nowMs - cachedLandmarkTimeMs[h] > handLossGraceMs) continue
-            for (k in 0 until 21) {
-                lmX[k] = cachedLandmarks[h][k * 2] * iw * scale + offsetX
-                lmY[k] = cachedLandmarks[h][k * 2 + 1] * ih * scale + offsetY
-            }
-            if (openMenu == SHOOT_MENU && gunOn[h]) drawPistol(canvas, h, scale, offsetX, offsetY)
+            if (openMenu == SHOOT_MENU && myIdx < MAX_HANDS && gunOn[myIdx]) drawPistol(canvas, myIdx, scale, offsetX, offsetY)
             if (handStyle == STYLE_QUEST) drawQuestHand(canvas) else drawNormalHand(canvas)
         }
     }
