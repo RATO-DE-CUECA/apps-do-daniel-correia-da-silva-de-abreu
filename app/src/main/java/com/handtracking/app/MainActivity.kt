@@ -370,9 +370,9 @@ class MainActivity : AppCompatActivity() {
             )
             .setRunningMode(RunningMode.LIVE_STREAM)
             .setNumHands(2)
-            .setMinHandDetectionConfidence(0.5f)
-            .setMinHandPresenceConfidence(0.5f)
-            .setMinTrackingConfidence(0.5f)
+            .setMinHandDetectionConfidence(0.45f)
+            .setMinHandPresenceConfidence(0.45f)
+            .setMinTrackingConfidence(0.45f)
             .setResultListener { result: HandLandmarkerResult, input ->
                 overlay.setResults(result, input.width, input.height)
             }
