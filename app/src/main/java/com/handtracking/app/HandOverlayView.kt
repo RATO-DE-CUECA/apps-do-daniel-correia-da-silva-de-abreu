@@ -49,9 +49,11 @@ import kotlin.math.sqrt
  *    "Menu": formato da barra (horizontal, em arco ou vertical). As escolhas ficam salvas no aparelho.
  *  - Menu azul ("Jogos"): lista dos jogos (Blocos e Tiro). A lista também sabe abrir jogos instalados no celular
  *    (APK) pelo nome, se algum for acrescentado em appGameNames.
- *  - Jogo "Tiro" (teste), pela lista de Jogos: ao fechar a mão toda, aparece uma pistola feita de blocos na
- *    sua mão (passo 1: só segurar; atirar vem depois). A pistola é um modelo 3D: ela gira junto com a mão (a
- *    orientação da mão em 3D vem dos pontos x, y e z do MediaPipe). Com a mão fechada ela não conta como pinça.
+ *  - Jogo "Tiro" (teste), pela lista de Jogos: abre uma mesa 3D com a pistola deitada em cima. Leve a mão até
+ *    a pistola e feche a mão toda em cima dela para pegá-la (um anel amarelo mostra quando a mão está no lugar).
+ *    Na mão, a pistola é um modelo 3D que gira junto com ela (a orientação da mão em 3D vem dos pontos x, y e z
+ *    do MediaPipe). Abrir a mão solta a pistola: ela cai na mesa, onde a mão estava. Vire a cabeça para ver a
+ *    mesa de outros lados. Com a mão fechada ela não conta como pinça. Atirar vem depois.
  *    Modelo: "PSX Firearms Free" de heyheythere, licença CC BY 4.0 (https://heyheythere.itch.io/psx-firearms-free),
  *    convertido para triângulos de cor lisa e guardado em GUN_MODEL (244 triângulos).
  *  - Menu amarelo: mini jogo 3D de empilhar blocos numa mesa. Pinça num bloco: ele sobe e você leva
@@ -263,6 +265,25 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     private val gunTmpX = FloatArray(21)
     private val gunTmpY = FloatArray(21)
     private val gunTmpZ = FloatArray(21)
+    // Mesa do jogo de tiro: a pistola começa deitada em cima da mesa e você a pega fechando a mão em cima dela.
+    private var gunHeld = -1                            // mão que está segurando a pistola (-1 = ela está na mesa)
+    private val gunWasOn = BooleanArray(MAX_HANDS)      // a mão estava fechada no quadro anterior?
+    private val gunCloseAt = LongArray(MAX_HANDS)       // quando a mão fechou (para pegar quem fecha a mão a caminho da pistola)
+    private var gunTX = 0f                              // onde a pistola está na mesa (x e z); gunTY = altura acima do tampo
+    private var gunTZ = GUN_HOME_Z
+    private var gunTY = 0f
+    private var gunTYaw = GUN_TABLE_YAW                 // para onde aponta o cano, girado em torno da vertical
+    private var gunHover = false                        // uma mão aberta está em cima da pistola da mesa
+    private var gunRadius = 0f                          // tamanho da pistola da mesa na tela (raio, para o "pegar")
+    private var shootLastMs = 0L
+    private val gunBox = FloatArray(6)                  // caixa do modelo: minX, maxX, minY, maxY, minZ, maxZ
+    private val gunTW = FloatArray(GUN_MAX_FACES * 9)   // pontos do modelo no mundo da mesa (x, y, z de cada ponto)
+    private val gunRingPaint = Paint().apply {
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        strokeWidth = 5f
+        color = Color.YELLOW
+    }
     // Modelo 3D da pistola: triângulos (3 pontos, normal e cor), montados uma vez; e áreas de trabalho do desenho.
     private var gunFaceCount = 0
     private val gunLV = FloatArray(GUN_MAX_FACES * 9)
@@ -653,7 +674,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         // No VR Box usa o giroscópio da hora do frame (a imagem e o menu ficam combinados).
         rot = if (vrMode) (frameRot ?: liveRot) else liveRot
         // Com o jogo aberto, a barra e o menu ficam presos à tela (a mesa gira com a cabeça, eles não).
-        worldActive = worldMode && rot != null && !isGameOpen()
+        worldActive = worldMode && rot != null && !isTableOpen()
         updateScene(iw, ih)
         updateDepthPivot(iw, ih)
 
@@ -679,6 +700,9 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
     /** O menu amarelo é o jogo de empilhar blocos. */
     private fun isGameOpen(): Boolean = openMenu == GAME_ICON
+
+    /** Menus que mostram uma mesa 3D: o jogo de blocos e o de tiro. */
+    private fun isTableOpen(): Boolean = openMenu == GAME_ICON || openMenu == SHOOT_MENU
 
     /** O menu vermelho mostra o YouTube (nos dois modos). */
     private fun isWebOpen(): Boolean = openMenu == YOUTUBE_ICON
@@ -831,7 +855,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             panelH = min(u * 0.45f, max(room, u * 0.2f))
             panelW = min(panelH / aspect, iw * 0.9f)
             panelH = panelW * aspect
-        } else if (isGameOpen()) {
+        } else if (isTableOpen()) {
             // Jogo: janela mais alta; o tamanho dos blocos é sempre proporcional à largura.
             panelW = min(u * (if (menuLayout == LAYOUT_ARC) 0.60f else 0.68f), iw * 0.9f)
             panelH = panelW * GAME_ASPECT
@@ -982,10 +1006,19 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         val prevMenu = openMenu
         openMenu = target
         popFor = -1
-        if (prevMenu == GAME_ICON && openMenu != GAME_ICON) anchorsPending = true   // a barra volta para a sua frente
-        if (openMenu == GAME_ICON) headRefReady = false                             // olhar daqui é o lado "de frente"
+        val wasTable = prevMenu == GAME_ICON || prevMenu == SHOOT_MENU
+        if (wasTable && !isTableOpen()) anchorsPending = true                       // a barra volta para a sua frente
+        if (isTableOpen()) headRefReady = false                                     // olhar daqui é o lado "de frente"
+        if (openMenu == SHOOT_MENU) {
+            // A mesa do tiro sempre abre no ângulo inicial, com a pistola no meio.
+            camYawManual = GAME_YAW0
+            camElevManual = GAME_ELEV0
+            camYaw = GAME_YAW0
+            camElev = GAME_ELEV0
+            resetShoot()
+        }
         if (openMenu == GAMES_ICON) scanGames()                                     // vê de novo o que está instalado
-        if (openMenu == GAME_ICON && !panelMoved[GAME_ICON]) lowerBarForGame(iw, ih)
+        if (isTableOpen() && !panelMoved[openMenu]) lowerBarForGame(iw, ih)
     }
 
     /** Escolheu um item da lista do •••. */
@@ -1201,6 +1234,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             gunOn[h] = false
             gunCnt[h] = 0
         }
+        if (openMenu == SHOOT_MENU) stepShoot(iw, ih, seenHands) else resetShoot()
 
         if ((grabbed == GAME_BLOCK || grabbed == GAME_RESET || grabbed == GAME_ORBIT) &&
             (!isGameOpen() || (grabbed == GAME_BLOCK && gameHeld < 0))
@@ -2417,6 +2451,31 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 gunLN[f * 3 + 1] = ny
                 gunLN[f * 3 + 2] = nz
             }
+            var mnx = 1e9f
+            var mxx = -1e9f
+            var mny = 1e9f
+            var mxy = -1e9f
+            var mnz = 1e9f
+            var mxz = -1e9f
+            for (f in 0 until n) {
+                for (k in 0 until 3) {
+                    val vx = gunLV[f * 9 + k * 3]
+                    val vy = gunLV[f * 9 + k * 3 + 1]
+                    val vz = gunLV[f * 9 + k * 3 + 2]
+                    if (vx < mnx) mnx = vx
+                    if (vx > mxx) mxx = vx
+                    if (vy < mny) mny = vy
+                    if (vy > mxy) mxy = vy
+                    if (vz < mnz) mnz = vz
+                    if (vz > mxz) mxz = vz
+                }
+            }
+            gunBox[0] = mnx
+            gunBox[1] = mxx
+            gunBox[2] = mny
+            gunBox[3] = mxy
+            gunBox[4] = mnz
+            gunBox[5] = mxz
             gunFaceCount = n
         } catch (e: Exception) {
             gunFaceCount = 0
@@ -2489,26 +2548,241 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         }
     }
 
-    /** Janela do jogo de tiro: explica como pegar a pistola e mostra se ela está na mão. */
+    /** Zera o jogo de tiro: a pistola volta ao meio da mesa. Roda sempre que o Tiro não está aberto. */
+    private fun resetShoot() {
+        gunHeld = -1
+        gunTX = 0f
+        gunTZ = GUN_HOME_Z
+        gunTY = 0f
+        gunTYaw = GUN_TABLE_YAW
+        gunHover = false
+        shootLastMs = 0L
+        for (h in 0 until MAX_HANDS) {
+            gunWasOn[h] = false
+            gunCloseAt[h] = 0L
+        }
+    }
+
+    /**
+     * Um passo do jogo de tiro: mexe a câmera da mesa, deixa a pistola cair se foi largada e vê se alguma mão
+     * fechou em cima da pistola da mesa (para pegá-la) ou está aberta em cima dela (para o anel amarelo).
+     */
+    private fun stepShoot(iw: Float, ih: Float, seenHands: Int) {
+        val now = SystemClock.uptimeMillis()
+        val dt = if (shootLastMs == 0L) 0.016f else ((now - shootLastMs) / 1000f).coerceIn(0.001f, 0.05f)
+        shootLastMs = now
+        updateGameCamera(dt, iw, ih)
+
+        // Largou: a mão que segurava abriu (ou saiu da imagem). A pistola cai na mesa, onde a mão estava.
+        if (gunHeld >= 0 && (gunHeld >= seenHands || !gunOn[gunHeld])) {
+            val hh = gunHeld
+            gunHeld = -1
+            var dropX = 0f
+            var dropZ = GUN_HOME_Z
+            if (gameRayPlane(layoutX(gunX[hh]), layoutY(gunY[hh]), 0f, hit2)) {
+                dropX = hit2[0]
+                dropZ = hit2[1]
+            }
+            gunTX = dropX.coerceIn(-GUN_EDGE, GUN_EDGE)
+            gunTZ = dropZ.coerceIn(-GUN_EDGE, GUN_EDGE)
+            gunTY = GUN_DROP_Y
+        }
+        // Cai até o tampo da mesa.
+        if (gunTY > 0f) {
+            gunTY += (0f - gunTY) * min(1f, 12f * dt)
+            if (gunTY < 0.004f) gunTY = 0f
+        }
+
+        // Quem acabou de fechar a mão: guarda a hora.
+        for (h in 0 until MAX_HANDS) {
+            if (gunOn[h] && !gunWasOn[h]) gunCloseAt[h] = now
+            gunWasOn[h] = gunOn[h]
+        }
+
+        gunHover = false
+        gunRadius = 0f
+        if (gunHeld >= 0) return
+        // Onde a pistola da mesa aparece na tela, e o tamanho dela.
+        val zc = gameProject(gunTX, gunTY, gunTZ, sp)
+        if (zc <= 0f) return
+        val px = sp[0]
+        val py = sp[1]
+        gunRadius = GUN_TABLE_LEN * 0.5f * vpF / zc
+        for (h in 0 until min(seenHands, MAX_HANDS)) {
+            val d = hypot(layoutX(gunX[h]) - px, layoutY(gunY[h]) - py)
+            if (d > gunRadius + gunHS[h] * GUN_PALM_REACH / dScale) continue
+            if (gunOn[h]) {
+                // Mão fechada em cima da pistola (fechou agora há pouco): pegou.
+                if (now - gunCloseAt[h] <= GUN_GRAB_MS) {
+                    gunHeld = h
+                    gunHover = false
+                    return
+                }
+            } else {
+                gunHover = true
+            }
+        }
+    }
+
+    /**
+     * Desenha a pistola deitada de lado na mesa, em perspectiva (a câmera da mesa), com sombra no tampo.
+     * O modelo tem x = cano, y = cima, z = lado; aqui o lado z fica para cima e o modelo gira em torno da vertical.
+     */
+    private fun drawPistolOnTable(canvas: Canvas) {
+        if (gunFaceCount == 0) buildGunMesh()
+        if (gunFaceCount == 0) return
+        val sc = GUN_TABLE_LEN / max(gunBox[1] - gunBox[0], 0.001f)
+        val mx = (gunBox[0] + gunBox[1]) / 2f
+        val my = (gunBox[2] + gunBox[3]) / 2f
+        val cg = cos(gunTYaw)
+        val sg = sin(gunTYaw)
+        // Os pontos no mundo da mesa.
+        for (q in 0 until gunFaceCount) {
+            val o = q * 9
+            for (k in 0 until 3) {
+                val lx = gunLV[o + k * 3] - mx
+                val ly = gunLV[o + k * 3 + 1] - my
+                val lz = gunLV[o + k * 3 + 2] - gunBox[4]
+                gunTW[o + k * 3] = gunTX + (lx * cg - ly * sg) * sc
+                gunTW[o + k * 3 + 1] = gunTY + lz * sc + 0.002f
+                gunTW[o + k * 3 + 2] = gunTZ + (-lx * sg - ly * cg) * sc
+            }
+        }
+
+        // Sombra no tampo: numa camada só, para não escurecer duas vezes onde os triângulos se sobrepõem.
+        val shadowA = (120f * (1f - min(1f, gunTY / 0.4f))).toInt()
+        if (shadowA > 4) {
+            canvas.saveLayerAlpha(panelLeft, panelTop, panelLeft + panelW, panelTop + panelH, shadowA)
+            fillPaint.color = Color.BLACK
+            for (q in 0 until gunFaceCount) {
+                val o = q * 9
+                var ok = true
+                for (k in 0 until 3) {
+                    if (gameProject(gunTW[o + k * 3], 0.003f, gunTW[o + k * 3 + 2], sp) <= 0f) {
+                        ok = false
+                        break
+                    }
+                    pq[k * 2] = sp[0]
+                    pq[k * 2 + 1] = sp[1]
+                }
+                if (!ok) continue
+                facePath.reset()
+                facePath.moveTo(pq[0], pq[1])
+                facePath.lineTo(pq[2], pq[3])
+                facePath.lineTo(pq[4], pq[5])
+                facePath.close()
+                canvas.drawPath(facePath, fillPaint)
+            }
+            canvas.restore()
+        }
+
+        // Só os triângulos virados para a câmera, de trás para frente.
+        var n = 0
+        for (q in 0 until gunFaceCount) {
+            val o = q * 9
+            val nx = gunLN[q * 3]
+            val ny = gunLN[q * 3 + 1]
+            val nz = gunLN[q * 3 + 2]
+            val wnx = nx * cg - ny * sg
+            val wny = nz
+            val wnz = -nx * sg - ny * cg
+            val cxw = (gunTW[o] + gunTW[o + 3] + gunTW[o + 6]) / 3f
+            val cyw = (gunTW[o + 1] + gunTW[o + 4] + gunTW[o + 7]) / 3f
+            val czw = (gunTW[o + 2] + gunTW[o + 5] + gunTW[o + 8]) / 3f
+            if (wnx * (camE[0] - cxw) + wny * (camE[1] - cyw) + wnz * (camE[2] - czw) <= 0f) continue
+            var zsum = 0f
+            var ok = true
+            for (k in 0 until 3) {
+                val d = gameProject(gunTW[o + k * 3], gunTW[o + k * 3 + 1], gunTW[o + k * 3 + 2], sp)
+                if (d <= 0f) {
+                    ok = false
+                    break
+                }
+                gunWV[o + k * 3] = sp[0]
+                gunWV[o + k * 3 + 1] = sp[1]
+                zsum += d
+            }
+            if (!ok) continue
+            gunWZ[q] = zsum / 3f
+            // Luz vinda de cima, da direita e de frente.
+            gunWS[q] = 0.55f + 0.5f * max(0f, 0.35f * wnx + 0.75f * wny + 0.45f * wnz)
+            gunOrd[n++] = q
+        }
+        for (a in 1 until n) {
+            val v = gunOrd[a]
+            var b = a - 1
+            while (b >= 0 && gunWZ[gunOrd[b]] < gunWZ[v]) {
+                gunOrd[b + 1] = gunOrd[b]
+                b--
+            }
+            gunOrd[b + 1] = v
+        }
+        gunPaint.strokeWidth = max(1f, panelW * 0.003f)
+        for (i in 0 until n) {
+            val q = gunOrd[i]
+            val o = q * 9
+            facePath.reset()
+            facePath.moveTo(gunWV[o], gunWV[o + 1])
+            facePath.lineTo(gunWV[o + 3], gunWV[o + 4])
+            facePath.lineTo(gunWV[o + 6], gunWV[o + 7])
+            facePath.close()
+            val c = shade(gunLC[q], gunWS[q])
+            fillPaint.color = c
+            canvas.drawPath(facePath, fillPaint)
+            gunPaint.color = c                       // contorno da mesma cor: tapa as frestinhas entre triângulos
+            canvas.drawPath(facePath, gunPaint)
+        }
+    }
+
+    /** Janela do jogo de tiro: a mesa 3D com a pistola em cima, e uma dica do que fazer. */
     private fun drawShootPanel(canvas: Canvas) {
         val bw = panelW
+        rect.set(panelLeft, panelTop, panelLeft + panelW, panelTop + panelH)
+        canvas.save()
+        canvas.clipRect(rect)
+        drawGameTable(canvas)
+        if (gunHeld < 0) {
+            drawPistolOnTable(canvas)
+            if (gunHover) {
+                // Anel amarelo no tampo em volta da pistola: a mão está no lugar, é só fechar.
+                val steps = 28
+                val rw = GUN_TABLE_LEN * 0.62f
+                var ax = 0f
+                var ay = 0f
+                var have = false
+                for (i in 0..steps) {
+                    val a = i * TWO_PI_F / steps
+                    val d = gameProject(gunTX + cos(a) * rw, 0.004f, gunTZ + sin(a) * rw, sp)
+                    if (d > 0f && have) canvas.drawLine(ax, ay, sp[0], sp[1], gunRingPaint)
+                    ax = sp[0]
+                    ay = sp[1]
+                    have = d > 0f
+                }
+            }
+        }
+        canvas.restore()
+
         thinPaint.textAlign = Paint.Align.LEFT
-        thinPaint.textSize = bw * 0.062f
-        canvas.drawText("Tiro (teste)", panelLeft + bw * 0.05f, panelTop + panelH * 0.20f, thinPaint)
-        thinPaint.textSize = bw * 0.043f
-        canvas.drawText("Feche a mão toda para", panelLeft + bw * 0.05f, panelTop + panelH * 0.44f, thinPaint)
-        canvas.drawText("pegar a pistola de blocos.", panelLeft + bw * 0.05f, panelTop + panelH * 0.60f, thinPaint)
-        var holding = 0
-        for (h in 0 until MAX_HANDS) if (gunOn[h]) holding++
-        thinPaint.color = if (holding > 0) Color.rgb(160, 235, 150) else Color.argb(190, 255, 255, 255)
-        canvas.drawText(if (holding > 0) "Pistola na mão" else "Mostre a mão e feche o punho", panelLeft + bw * 0.05f, panelTop + panelH * 0.84f, thinPaint)
-        thinPaint.color = Color.argb(170, 255, 255, 255)
-        thinPaint.textSize = bw * 0.028f
-        canvas.drawText("Pistola: PSX Firearms Free, heyheythere (CC BY 4.0)", panelLeft + bw * 0.05f, panelTop + panelH * 0.95f, thinPaint)
         thinPaint.color = Color.WHITE
-        // A pistola da vitrine gira devagar, para mostrar que é 3D.
-        val spin = (SystemClock.uptimeMillis() % 7000L) / 7000f * TWO_PI_F
-        drawPistolPreview(canvas, panelLeft + bw * 0.76f, panelTop + panelH * 0.50f, panelH * 0.066f, spin, 0.3f)
+        thinPaint.textSize = bw * 0.055f
+        canvas.drawText("Tiro (teste)", panelLeft + bw * 0.04f, panelTop + bw * 0.092f, thinPaint)
+        thinPaint.textSize = bw * 0.034f
+        val tip: String
+        if (gunHeld >= 0) {
+            thinPaint.color = Color.rgb(160, 235, 150)
+            tip = "Pistola na mão. Abra a mão para soltar."
+        } else if (gunHover) {
+            thinPaint.color = Color.rgb(255, 235, 120)
+            tip = "Feche a mão para pegar a pistola."
+        } else {
+            thinPaint.color = Color.argb(200, 255, 255, 255)
+            tip = "Leve a mão até a pistola e feche."
+        }
+        canvas.drawText(tip, panelLeft + bw * 0.04f, panelTop + bw * 0.145f, thinPaint)
+        thinPaint.color = Color.argb(170, 255, 255, 255)
+        thinPaint.textSize = bw * 0.026f
+        canvas.drawText("Pistola: PSX Firearms Free, heyheythere (CC BY 4.0)", panelLeft + bw * 0.04f, panelTop + panelH - bw * 0.025f, thinPaint)
+        thinPaint.color = Color.WHITE
     }
 
     /** Menu de configurações: título, duas abas (Mão e Menu) e cartões para escolher. */
@@ -2692,7 +2966,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 lmX[k] = hand[k].x() * iw * scale + offsetX
                 lmY[k] = hand[k].y() * ih * scale + offsetY
             }
-            if (openMenu == SHOOT_MENU && myIdx < MAX_HANDS && gunOn[myIdx]) drawPistol(canvas, myIdx, scale, offsetX, offsetY)
+            if (openMenu == SHOOT_MENU && myIdx < MAX_HANDS && gunHeld == myIdx && gunOn[myIdx]) drawPistol(canvas, myIdx, scale, offsetX, offsetY)
             if (handStyle == STYLE_QUEST) drawQuestHand(canvas) else drawNormalHand(canvas)
         }
     }
@@ -2943,7 +3217,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             canvas.translate(-cx, -cy)
         }
         // O jogo e o YouTube têm toques precisos: ficam retos.
-        val tilted = m != YOUTUBE_ICON && m != GAME_ICON &&
+        val tilted = m != YOUTUBE_ICON && m != GAME_ICON && m != SHOOT_MENU &&
             beginTilt(canvas, panelLeft, panelTop, panelLeft + panelW, panelTop + panelH)
 
         val rad = gap * 2f
@@ -3181,6 +3455,13 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val GUN_MODEL = "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"
         const val GUN_Z_GAIN = 1.0f   // quanto confiar na profundidade (z) dos pontos da mão
         const val GUN_OFF_FRAMES = 4 // quadros com a mão aberta para a pistola sumir
+        const val GUN_TABLE_LEN = 0.50f   // comprimento da pistola na mesa (a mesa tem 1,0 de lado)
+        const val GUN_HOME_Z = 0.05f      // onde a pistola começa na mesa (z; x = 0 é o meio)
+        const val GUN_EDGE = 0.38f        // até onde a pistola pode ser largada (longe da borda da mesa)
+        const val GUN_TABLE_YAW = 0.35f   // giro inicial da pistola na mesa (radianos)
+        const val GUN_DROP_Y = 0.22f      // altura de onde a pistola cai ao ser largada
+        const val GUN_GRAB_MS = 600L      // a mão que fechou há menos que isso, em cima da pistola, pega ela
+        const val GUN_PALM_REACH = 0.35f  // quanto da palma (fração) conta além do tamanho da pistola, no "pegar"
         const val GAME_ICON = 3      // o ícone amarelo abre o jogo de empilhar blocos
 
         // Formatos da barra.
