@@ -488,6 +488,20 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         strokeWidth = 2f
         color = Color.argb(50, 255, 255, 255)
     }
+    private val tblLegD = FloatArray(4)           // mesa: distância de cada perna até a câmera (para desenhar de trás para frente)
+    private val tblLegO = IntArray(4)
+    private val tblSeamPaint = Paint().apply {      // emenda entre as tábuas do tampo
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        strokeWidth = 2.5f
+        color = Color.argb(110, 80, 52, 28)
+    }
+    private val tblGrainPaint = Paint().apply {     // veio da madeira
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        strokeWidth = 1.2f
+        color = Color.argb(42, 90, 60, 30)
+    }
 
     private var resetCX = 0f
     private var resetCY = 0f
@@ -1808,7 +1822,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         camU[2] = rx * camF[1]
 
         vpCX = panelLeft + panelW / 2f
-        vpCY = panelTop + panelH * 0.57f
+        vpCY = panelTop + panelH * 0.38f       // a mesa fica mais alta na janela: embaixo cabem as pernas
         vpF = panelW * GAME_SCALE * GAME_DIST
     }
 
@@ -2077,29 +2091,115 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         if (outline) canvas.drawPath(facePath, outlinePaint)
     }
 
+    /**
+     * Caixa reta da mesa (perna ou travessa): só as laterais que olham para a câmera (de cima não se vê o fundo,
+     * e o topo fica escondido embaixo do tampo).
+     */
+    private fun drawTableBox(canvas: Canvas, x0: Float, x1: Float, y0: Float, y1: Float, z0: Float, z1: Float, base: Int) {
+        if (camE[0] > x1) quad(canvas, shade(base, 0.62f), true, x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1)
+        if (camE[0] < x0) quad(canvas, shade(base, 0.78f), true, x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0)
+        if (camE[2] > z1) quad(canvas, shade(base, 0.88f), true, x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1)
+        if (camE[2] < z0) quad(canvas, shade(base, 0.55f), true, x1, y0, z0, x0, y0, z0, x0, y1, z0, x1, y1, z0)
+    }
+
+    /**
+     * A mesa dos jogos: uma mesa de madeira de verdade, com 4 pernas, travessas, tampo grosso com tábuas e sombra
+     * no chão. O tampo continua indo de -0,5 a 0,5 e a superfície de jogo é y = 0, como sempre. Desenha de baixo
+     * para cima (sombra, pernas de trás, travessas, pernas da frente, lateral do tampo, tampo), então funciona de
+     * qualquer lado que a câmera olhe.
+     */
     private fun drawGameTable(canvas: Canvas) {
         val h = TABLE_HALF
-        val th = 0.07f
-        val sideA = Color.rgb(104, 72, 48)
-        val sideB = Color.rgb(78, 53, 35)
-        if (camE[0] > h) quad(canvas, sideA, true, h, 0f, h, h, 0f, -h, h, -th, -h, h, -th, h)
-        if (camE[0] < -h) quad(canvas, sideB, true, -h, 0f, -h, -h, 0f, h, -h, -th, h, -h, -th, -h)
-        if (camE[2] > h) quad(canvas, sideB, true, -h, 0f, h, h, 0f, h, h, -th, h, -h, -th, h)
-        if (camE[2] < -h) quad(canvas, sideA, true, h, 0f, -h, -h, 0f, -h, -h, -th, -h, h, -th, -h)
-        // Tampo.
-        quad(canvas, Color.rgb(46, 96, 66), true, -h, 0f, -h, h, 0f, -h, h, 0f, h, -h, 0f, h)
-        // Linhas da mesa: ajudam a perceber o giro e a profundidade.
-        for (g in 1..3) {
-            val t = -h + g * (2f * h / 4f)
-            if (gameProject(t, 0f, -h, sp) > 0f) {
-                val ax = sp[0]
-                val ay = sp[1]
-                if (gameProject(t, 0f, h, sp) > 0f) canvas.drawLine(ax, ay, sp[0], sp[1], gridPaint)
+        val th = TABLE_TH
+        val legY = -TABLE_LEG
+        // Sombra suave no chão (três camadas, cada uma menor e mais escura).
+        val sh = floatArrayOf(0.64f, 0.58f, 0.52f)
+        val sa = intArrayOf(18, 20, 24)
+        for (k in 0 until 3) {
+            val e = sh[k]
+            quad(canvas, Color.argb(sa[k], 0, 0, 0), false, -e, legY + 0.002f, -e, e, legY + 0.002f, -e, e, legY + 0.002f, e, -e, legY + 0.002f, e)
+        }
+        // Pernas: as duas mais longe da câmera antes das travessas, as duas mais perto depois.
+        val lo = h - 0.105f
+        val hi = h - 0.03f
+        val legColor = Color.rgb(112, 78, 48)
+        val railColor = Color.rgb(98, 68, 42)
+        for (k in 0 until 4) {
+            val sx = if ((k and 1) == 0) -1f else 1f
+            val sz = if ((k and 2) == 0) -1f else 1f
+            val dx = sx * (lo + hi) / 2f - camE[0]
+            val dy = (legY - th) / 2f - camE[1]
+            val dz = sz * (lo + hi) / 2f - camE[2]
+            tblLegD[k] = dx * dx + dy * dy + dz * dz
+            tblLegO[k] = k
+        }
+        for (a in 1 until 4) {                       // do mais longe para o mais perto
+            val v = tblLegO[a]
+            var b = a - 1
+            while (b >= 0 && tblLegD[tblLegO[b]] < tblLegD[v]) {
+                tblLegO[b + 1] = tblLegO[b]
+                b--
             }
-            if (gameProject(-h, 0f, t, sp) > 0f) {
-                val ax = sp[0]
-                val ay = sp[1]
-                if (gameProject(h, 0f, t, sp) > 0f) canvas.drawLine(ax, ay, sp[0], sp[1], gridPaint)
+            tblLegO[b + 1] = v
+        }
+        for (n in 0 until 4) {
+            if (n == 2) {
+                // Travessas (a moldura embaixo do tampo): duas ao longo de x e duas ao longo de z.
+                for (s in 0..1) {
+                    val z0 = if (s == 0) -hi else hi - 0.03f
+                    val x0 = if (s == 0) -hi else hi - 0.03f
+                    drawTableBox(canvas, -lo, lo, -0.16f, -th, z0, z0 + 0.03f, railColor)
+                    drawTableBox(canvas, x0, x0 + 0.03f, -0.16f, -th, -lo, lo, railColor)
+                }
+            }
+            val k = tblLegO[n]
+            val sx = if ((k and 1) == 0) -1f else 1f
+            val sz = if ((k and 2) == 0) -1f else 1f
+            val x0 = if (sx > 0f) lo else -hi
+            val z0 = if (sz > 0f) lo else -hi
+            drawTableBox(canvas, x0, x0 + (hi - lo), legY, -th, z0, z0 + (hi - lo), legColor)
+        }
+        // Lateral do tampo (madeira mais escura, com uma faixa clara em cima no canto arredondado).
+        val side = Color.rgb(150, 106, 64)
+        val bd = 0.014f
+        if (camE[0] > h) {
+            quad(canvas, shade(side, 0.95f), true, h, 0f, h, h, 0f, -h, h, -th, -h, h, -th, h)
+            quad(canvas, shade(side, 1.16f), false, h, 0f, h, h, 0f, -h, h, -bd, -h, h, -bd, h)
+        }
+        if (camE[0] < -h) {
+            quad(canvas, shade(side, 0.75f), true, -h, 0f, -h, -h, 0f, h, -h, -th, h, -h, -th, -h)
+            quad(canvas, shade(side, 0.92f), false, -h, 0f, -h, -h, 0f, h, -h, -bd, h, -h, -bd, -h)
+        }
+        if (camE[2] > h) {
+            quad(canvas, shade(side, 0.78f), true, -h, 0f, h, h, 0f, h, h, -th, h, -h, -th, h)
+            quad(canvas, shade(side, 0.95f), false, -h, 0f, h, h, 0f, h, h, -bd, h, -h, -bd, h)
+        }
+        if (camE[2] < -h) {
+            quad(canvas, shade(side, 0.88f), true, h, 0f, -h, -h, 0f, -h, -h, -th, -h, h, -th, -h)
+            quad(canvas, shade(side, 1.08f), false, h, 0f, -h, -h, 0f, -h, -h, -bd, -h, h, -bd, -h)
+        }
+        // Tampo: 5 tábuas de tons um pouco diferentes, com as emendas e o veio da madeira.
+        val top = Color.rgb(190, 146, 94)
+        for (p in 0 until 5) {
+            val z0 = -h + p * 0.2f
+            quad(canvas, shade(top, TABLE_PLANK[p]), false, -h, 0f, z0, h, 0f, z0, h, 0f, z0 + 0.2f, -h, 0f, z0 + 0.2f)
+        }
+        for (p in 0 until 5) {
+            if (p > 0) drawTableLine(canvas, -h + p * 0.2f, tblSeamPaint)           // emenda entre tábuas
+            drawTableLine(canvas, -h + p * 0.2f + 0.06f, tblGrainPaint)             // veio
+            drawTableLine(canvas, -h + p * 0.2f + 0.14f, tblGrainPaint)
+        }
+        // Borda do tampo.
+        for (k in 0 until 4) {
+            val ax = if (k == 0 || k == 3) -h else h
+            val az = if (k < 2) -h else h
+            val k2 = (k + 1) and 3
+            val bx = if (k2 == 0 || k2 == 3) -h else h
+            val bz = if (k2 < 2) -h else h
+            if (gameProject(ax, 0f, az, sp) > 0f) {
+                val px = sp[0]
+                val py = sp[1]
+                if (gameProject(bx, 0f, bz, sp) > 0f) canvas.drawLine(px, py, sp[0], sp[1], outlinePaint)
             }
         }
         // Marca amarela num canto: mostra de que lado você está olhando.
@@ -2108,6 +2208,14 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             fillPaint.color = Color.rgb(255, 214, 64)
             canvas.drawCircle(sp[0], sp[1], max(vpF / zc * 0.03f, 3f), fillPaint)
         }
+    }
+
+    /** Linha no tampo (de uma ponta à outra em x) na posição z: emenda ou veio da madeira. */
+    private fun drawTableLine(canvas: Canvas, z: Float, paint: Paint) {
+        if (gameProject(-TABLE_HALF, 0f, z, sp) <= 0f) return
+        val ax = sp[0]
+        val ay = sp[1]
+        if (gameProject(TABLE_HALF, 0f, z, sp) > 0f) canvas.drawLine(ax, ay, sp[0], sp[1], paint)
     }
 
     private fun drawGameBox(canvas: Canvas, i: Int) {
@@ -4005,13 +4113,16 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val GAME_BLOCKS = 5
         const val GAME_BH = 0.12f         // altura de cada bloco
         const val TABLE_HALF = 0.5f       // metade do lado da mesa
+        const val TABLE_TH = 0.07f        // grossura do tampo da mesa
+        const val TABLE_LEG = 0.30f       // altura das pernas (do chão até o topo do tampo)
+        val TABLE_PLANK = floatArrayOf(1.0f, 0.94f, 1.04f, 0.97f, 1.02f)   // tom de cada tábua do tampo
         const val GAME_ASPECT = 0.80f     // altura / largura da janela do jogo
         const val GAME_GRAVITY = 3.0f
         const val GAME_SLIDE = 0.5f       // velocidade de quem escorrega da ponta de outro bloco
         const val GAME_CARRY_Y = 0.55f    // altura da base do bloco quando você o segura
         const val GAME_BAR_Y = 0.80f      // a barra desce até aqui ao abrir o jogo
         const val GAME_DIST = 2.6f        // distância da câmera até a mesa
-        const val GAME_SCALE = 0.55f      // tamanho da mesa na janela (fração da largura, por unidade)
+        const val GAME_SCALE = 0.50f      // tamanho da mesa na janela (fração da largura, por unidade)
         const val GAME_TARGET_Y = 0.22f   // altura do ponto para onde a câmera olha
         const val GAME_YAW0 = 0.45f       // giro inicial da câmera (radianos)
         const val GAME_ELEV0 = 0.70f      // inclinação inicial da câmera (radianos, ~40 graus)
