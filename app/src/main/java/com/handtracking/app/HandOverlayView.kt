@@ -47,7 +47,7 @@ import kotlin.math.sqrt
  *    (pinça rápida = clique, pinça e arrastar = rolar).
  *  - Menu verde: configurações, em duas abas. "Mão": estilo da mão (normal ou Meta Quest).
  *    "Menu": formato da barra (horizontal, em arco ou vertical). As escolhas ficam salvas no aparelho.
- *  - Menu azul ("Jogos"): lista dos jogos (Blocos e Tiro). A lista também sabe abrir jogos instalados no celular
+ *  - Menu azul ("Jogos"): lista dos jogos (Blocos, Tiro e Física). A lista também sabe abrir jogos instalados no celular
  *    (APK) pelo nome, se algum for acrescentado em appGameNames.
  *  - Jogo "Tiro" (teste), pela lista de Jogos: abre uma mesa 3D com a pistola deitada em cima. Leve a mão até
  *    a pistola e feche a mão toda em cima dela para pegá-la (um anel amarelo mostra quando a mão está no lugar).
@@ -56,6 +56,12 @@ import kotlin.math.sqrt
  *    mesa de outros lados. Com a mão fechada ela não conta como pinça. Atirar vem depois.
  *    Modelo: "PSX Firearms Free" de heyheythere, licença CC BY 4.0 (https://heyheythere.itch.io/psx-firearms-free),
  *    convertido para triângulos de cor lisa e guardado em GUN_MODEL (244 triângulos).
+ *  - Jogo "Física" (teste), pela lista de Jogos: uma mesa 3D com um quadrado e um disco (círculo). A mão toda
+ *    (palma e cada dedo) é um conjunto de pequenos círculos na mesa que EMPURRAM os dois: eles deslizam com atrito,
+ *    giram, batem um no outro e quicam nas bordas. Fechar a mão toda em cima de um deles o SEGURA (ele sobe um pouco
+ *    e acompanha a mão; girar a mão gira o objeto); abrir a mão solta, e se a mão estava se mexendo ele sai
+ *    arremessado. A física fica na classe PhysTable (no fim deste arquivo); os valores de atrito, quique e peso
+ *    estão no começo dela e é só mudar os números. Fechar e abrir o menu de novo reinicia.
  *  - Menu amarelo: mini jogo 3D de empilhar blocos numa mesa. Pinça num bloco: ele sobe e você leva
  *    até onde quer (a marca amarela na mesa mostra onde ele vai cair); solta para cair. Para ver a mesa
  *    de outros lados: vire a cabeça (a mesa "gira" junto) ou faça pinça na mesa e arraste. O botão
@@ -300,14 +306,44 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         color = Color.argb(170, 20, 24, 34)
     }
 
+    // ---- Jogo de física (teste): quadrado e disco numa mesa, empurrados e segurados com a mão toda ----
+    private val phys = PhysTable()                         // a física em si (fim deste arquivo)
+    private var physInit = false                           // o jogo já foi iniciado nesta abertura do menu?
+    private var physLastMs = 0L
+    private val physHeld = IntArray(MAX_HANDS) { -1 }      // corpo que cada mão segura (-1 = nenhum)
+    private val physWasOn = BooleanArray(MAX_HANDS)        // a mão estava fechada no quadro anterior?
+    private val physCloseAt = LongArray(MAX_HANDS)         // quando a mão fechou
+    private val physLmX = FloatArray(MAX_HANDS * 21)       // pontos da mão em pixels da imagem (copiados a cada quadro)
+    private val physLmY = FloatArray(MAX_HANDS * 21)
+    private val physCurX = FloatArray(MAX_HANDS * 21)      // pontos da mão na mesa (x e z), agora
+    private val physCurZ = FloatArray(MAX_HANDS * 21)
+    private val physPrevX = FloatArray(MAX_HANDS * 21)     // e no quadro anterior (os passos curtos andam entre os dois)
+    private val physPrevZ = FloatArray(MAX_HANDS * 21)
+    private val physVelX = FloatArray(MAX_HANDS * 21)      // velocidade de cada ponto (mesa por segundo, suavizada)
+    private val physVelZ = FloatArray(MAX_HANDS * 21)
+    private val physHandOk = BooleanArray(MAX_HANDS)       // a mão está na imagem e dá para levá-la até a mesa
+    private val physPalmX = FloatArray(MAX_HANDS)          // centro da palma na mesa
+    private val physPalmZ = FloatArray(MAX_HANDS)
+    private val physHandAng = FloatArray(MAX_HANDS)        // para onde aponta a mão na mesa (radianos)
+    private val physHsT = FloatArray(MAX_HANDS)            // tamanho da mão na mesa (pulso até o nó do médio)
+    private val physOffX = FloatArray(2)                   // onde o corpo fica em relação à palma enquanto segurado
+    private val physOffZ = FloatArray(2)
+    private val physAngOff = FloatArray(2)                 // giro do corpo em relação à mão
+    private val physHover = BooleanArray(2)                // uma mão aberta está em cima do corpo (anel amarelo)
+    private val physTgtX = FloatArray(21)                  // áreas de trabalho: pontos da mão na mesa (alvo) e cantos do quadrado
+    private val physTgtZ = FloatArray(21)
+    private val physCX = FloatArray(4)
+    private val physCZ = FloatArray(4)
+
     // ---- App "Jogos": abre jogos (APK) que já estão instalados no celular ----
     private val appCtx: Context = context
     // Para pôr um jogo novo: acrescente o nome aqui, true se for do próprio app (e o menu que ele abre) ou false
     // se for um APK instalado no celular (e pedaços do nome dele em appGameKeys).
-    private val appGameNames = arrayOf("Blocos", "Tiro")                       // nome mostrado
-    private val appGameBuiltIn = booleanArrayOf(true, true)                   // true = jogo do próprio app (abre aqui dentro)
-    private val appGameMenu = intArrayOf(GAME_ICON, SHOOT_MENU)               // menu que o jogo do app abre
+    private val appGameNames = arrayOf("Blocos", "Tiro", "Física")                // nome mostrado
+    private val appGameBuiltIn = booleanArrayOf(true, true, true)             // true = jogo do próprio app (abre aqui dentro)
+    private val appGameMenu = intArrayOf(GAME_ICON, SHOOT_MENU, PHYS_MENU)    // menu que o jogo do app abre
     private val appGameKeys = arrayOf(                                        // jeitos de o nome aparecer no celular (só para APKs)
+        emptyArray<String>(),
         emptyArray<String>(),
         emptyArray<String>()
     )
@@ -690,7 +726,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         notifyWebPanel(iw, ih)
 
         // O jogo precisa redesenhar sempre (os blocos caem sozinhos).
-        if (isGameOpen() || animating || openMenu == SHOOT_MENU || depthSettling ||
+        if (isGameOpen() || animating || openMenu == SHOOT_MENU || openMenu == PHYS_MENU || depthSettling ||
             SystemClock.uptimeMillis() < depthShowUntil
         ) postInvalidateOnAnimation()
     }
@@ -701,8 +737,8 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     /** O menu amarelo é o jogo de empilhar blocos. */
     private fun isGameOpen(): Boolean = openMenu == GAME_ICON
 
-    /** Menus que mostram uma mesa 3D: o jogo de blocos e o de tiro. */
-    private fun isTableOpen(): Boolean = openMenu == GAME_ICON || openMenu == SHOOT_MENU
+    /** Menus que mostram uma mesa 3D: o jogo de blocos, o de tiro e o de física. */
+    private fun isTableOpen(): Boolean = openMenu == GAME_ICON || openMenu == SHOOT_MENU || openMenu == PHYS_MENU
 
     /** O menu vermelho mostra o YouTube (nos dois modos). */
     private fun isWebOpen(): Boolean = openMenu == YOUTUBE_ICON
@@ -1006,16 +1042,16 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         val prevMenu = openMenu
         openMenu = target
         popFor = -1
-        val wasTable = prevMenu == GAME_ICON || prevMenu == SHOOT_MENU
+        val wasTable = prevMenu == GAME_ICON || prevMenu == SHOOT_MENU || prevMenu == PHYS_MENU
         if (wasTable && !isTableOpen()) anchorsPending = true                       // a barra volta para a sua frente
         if (isTableOpen()) headRefReady = false                                     // olhar daqui é o lado "de frente"
-        if (openMenu == SHOOT_MENU) {
-            // A mesa do tiro sempre abre no ângulo inicial, com a pistola no meio.
+        if (openMenu == SHOOT_MENU || openMenu == PHYS_MENU) {
+            // A mesa do tiro e a da física sempre abrem no ângulo inicial, com os objetos no lugar.
             camYawManual = GAME_YAW0
             camElevManual = GAME_ELEV0
             camYaw = GAME_YAW0
             camElev = GAME_ELEV0
-            resetShoot()
+            if (openMenu == SHOOT_MENU) resetShoot() else resetPhys()
         }
         if (openMenu == GAMES_ICON) scanGames()                                     // vê de novo o que está instalado
         if (isTableOpen() && !panelMoved[openMenu]) lowerBarForGame(iw, ih)
@@ -1149,13 +1185,20 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             for (hand in res.landmarks()) {
                 val hIdx = seenHands++
                 if (hand.size <= MIDDLE_MCP) continue
-                if (hand.size >= 21 && hIdx < MAX_HANDS && openMenu == SHOOT_MENU) {
+                if (hand.size >= 21 && hIdx < MAX_HANDS && (openMenu == SHOOT_MENU || openMenu == PHYS_MENU)) {
                     for (k in 0 until 21) {
                         gunTmpX[k] = hand[k].x() * iw
                         gunTmpY[k] = hand[k].y() * ih
                         gunTmpZ[k] = hand[k].z() * iw      // profundidade: na mesma escala do x (negativo = mais perto)
                     }
                     updateGunHand(hIdx, gunTmpX, gunTmpY, gunTmpZ)
+                    if (openMenu == PHYS_MENU) {
+                        // O jogo de física usa todos os pontos da mão (em pixels da imagem).
+                        for (k in 0 until 21) {
+                            physLmX[hIdx * 21 + k] = gunTmpX[k]
+                            physLmY[hIdx * 21 + k] = gunTmpY[k]
+                        }
+                    }
                 } else if (hIdx < MAX_HANDS) {
                     gunOn[hIdx] = false
                     gunCnt[hIdx] = 0
@@ -1235,6 +1278,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             gunCnt[h] = 0
         }
         if (openMenu == SHOOT_MENU) stepShoot(iw, ih, seenHands) else resetShoot()
+        if (openMenu == PHYS_MENU) stepPhys(iw, ih, seenHands) else physInit = false
 
         if ((grabbed == GAME_BLOCK || grabbed == GAME_RESET || grabbed == GAME_ORBIT) &&
             (!isGameOpen() || (grabbed == GAME_BLOCK && gameHeld < 0))
@@ -1642,7 +1686,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             val st = iconState[i]
             val targetScale = if (st == 2) 1.22f else if (st == 1) 1.12f else 1f
             val targetGlow = if (st == 0) 0f else 1f
-            val targetDot = if (openMenu == i || (i == GAMES_ICON && (openMenu == GAME_ICON || openMenu == SHOOT_MENU))) 1f else 0f
+            val targetDot = if (openMenu == i || (i == GAMES_ICON && (openMenu == GAME_ICON || openMenu == SHOOT_MENU || openMenu == PHYS_MENU))) 1f else 0f
             iconScale[i] += (targetScale - iconScale[i]) * kIcon
             iconGlow[i] += (targetGlow - iconGlow[i]) * kIcon
             iconDot[i] += (targetDot - iconDot[i]) * kIcon
@@ -2222,6 +2266,8 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             val cx = tileL[g] + tileW / 2f
             if (appGameMenu[g] == SHOOT_MENU) {
                 drawPistolPreview(canvas, cx, tileT + tileH * 0.37f, tileH * 0.075f, 0.6f, 0.32f)
+            } else if (appGameMenu[g] == PHYS_MENU) {
+                drawPhysPreview(canvas, cx, tileT + tileH * 0.37f, tileH * 0.13f)
             } else if (appGameBuiltIn[g]) {
                 glyphCube(canvas, cx, tileT + tileH * 0.36f, tileH * 0.34f)
             } else {
@@ -2232,10 +2278,26 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             canvas.drawText(appGameNames[g], cx, tileT + tileH * 0.76f, thinPaint)
             thinPaint.textSize = bw * 0.031f
             thinPaint.color = Color.argb(200, 255, 255, 255)
-            val status = if (appGameMenu[g] == SHOOT_MENU) "Teste" else if (appGameBuiltIn[g]) "Jogar" else if (ok) "Abrir" else "Não instalado"
+            val status = if (appGameMenu[g] == SHOOT_MENU || appGameMenu[g] == PHYS_MENU) "Teste" else if (appGameBuiltIn[g]) "Jogar" else if (ok) "Abrir" else "Não instalado"
             canvas.drawText(status, cx, tileT + tileH * 0.92f, thinPaint)
             thinPaint.color = Color.WHITE
         }
+    }
+
+    /** Desenho do cartão "Física": um quadrado inclinado e um disco, lado a lado. s = tamanho de referência. */
+    private fun drawPhysPreview(canvas: Canvas, cx: Float, cy: Float, s: Float) {
+        val sx = cx - s * 0.95f
+        val sy = cy + s * 0.1f
+        canvas.save()
+        canvas.rotate(16f, sx, sy)
+        rect.set(sx - s * 0.8f, sy - s * 0.8f, sx + s * 0.8f, sy + s * 0.8f)
+        fillPaint.color = Color.rgb(239, 83, 80)
+        canvas.drawRoundRect(rect, s * 0.14f, s * 0.14f, fillPaint)
+        canvas.restore()
+        fillPaint.color = Color.rgb(66, 165, 245)
+        canvas.drawCircle(cx + s * 0.95f, cy - s * 0.05f, s * 0.85f, fillPaint)
+        fillPaint.color = Color.argb(70, 255, 255, 255)
+        canvas.drawCircle(cx + s * 0.8f, cy - s * 0.25f, s * 0.45f, fillPaint)
     }
 
     /**
@@ -2785,6 +2847,396 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         thinPaint.color = Color.WHITE
     }
 
+    // ---------- jogo de física (teste) ----------
+
+    /** Volta o quadrado e o disco ao lugar e solta tudo. Roda ao abrir o menu da Física. */
+    private fun resetPhys() {
+        phys.reset()
+        physInit = true
+        physLastMs = 0L
+        for (h in 0 until MAX_HANDS) {
+            physHeld[h] = -1
+            physWasOn[h] = false
+            physCloseAt[h] = 0L
+            physHandOk[h] = false
+        }
+        for (i in 0..1) {
+            physHover[i] = false
+            physOffX[i] = 0f
+            physOffZ[i] = 0f
+            physAngOff[i] = 0f
+        }
+    }
+
+    /**
+     * Leva os 21 pontos da mão h (pixels da imagem, em physLmX/Y) para a mesa (x e z, na altura PHYS_PLANE_Y).
+     * Os pontos da mesa andam suavemente até o ponto novo (a detecção chega ~30 vezes por segundo, o desenho 60),
+     * e a velocidade de cada ponto sai desse movimento. Devolve false se algum ponto não cai na mesa.
+     */
+    private fun projectPhysHand(h: Int, dt: Float): Boolean {
+        val b = h * 21
+        val wasOk = physHandOk[h]
+        for (j in 0 until 21) {
+            if (!gameRayPlane(layoutX(physLmX[b + j]), layoutY(physLmY[b + j]), PHYS_PLANE_Y, hit2)) return false
+            physTgtX[j] = hit2[0]
+            physTgtZ[j] = hit2[1]
+        }
+        val k = if (wasOk) 1f - exp(-dt * PHYS_HAND_FOLLOW) else 1f
+        for (j in 0 until 21) {
+            val i = b + j
+            if (!wasOk) {
+                physCurX[i] = physTgtX[j]
+                physCurZ[i] = physTgtZ[j]
+                physPrevX[i] = physCurX[i]
+                physPrevZ[i] = physCurZ[i]
+                physVelX[i] = 0f
+                physVelZ[i] = 0f
+            } else {
+                physPrevX[i] = physCurX[i]
+                physPrevZ[i] = physCurZ[i]
+                physCurX[i] += (physTgtX[j] - physCurX[i]) * k
+                physCurZ[i] += (physTgtZ[j] - physCurZ[i]) * k
+                physVelX[i] += ((physCurX[i] - physPrevX[i]) / dt - physVelX[i]) * 0.5f
+                physVelZ[i] += ((physCurZ[i] - physPrevZ[i]) / dt - physVelZ[i]) * 0.5f
+            }
+        }
+        // Centro da palma (pulso e os 4 nós dos dedos), tamanho da mão e para onde ela aponta.
+        var px = physCurX[b] + physCurX[b + 5] + physCurX[b + 9] + physCurX[b + 13] + physCurX[b + 17]
+        var pz = physCurZ[b] + physCurZ[b + 5] + physCurZ[b + 9] + physCurZ[b + 13] + physCurZ[b + 17]
+        px /= 5f
+        pz /= 5f
+        physPalmX[h] = px
+        physPalmZ[h] = pz
+        val dx = physCurX[b + MIDDLE_MCP] - physCurX[b + WRIST]
+        val dz = physCurZ[b + MIDDLE_MCP] - physCurZ[b + WRIST]
+        val len = hypot(dx, dz)
+        physHsT[h] = len.coerceIn(PHYS_HS_MIN, PHYS_HS_MAX)
+        if (len > 0.02f) {
+            val a = atan2(dz, dx)
+            physHandAng[h] = if (wasOk) physHandAng[h] + PhysTable.wrapAngle(a - physHandAng[h]) * 0.5f else a
+        }
+        return true
+    }
+
+    /** Preenche os colizores da mão (dedos e palma) para o passo curto u (0 a 1) entre o quadro anterior e o de agora. */
+    private fun fillPhysColliders(u: Float) {
+        var n = 0
+        for (h in 0 until PHYS_HANDS) {
+            if (!physHandOk[h]) continue
+            val b = h * 21
+            val hs = physHsT[h]
+            val fr = (hs * PHYS_FINGER_R).coerceIn(0.012f, 0.06f)
+            val pr = (hs * PHYS_PALM_R).coerceIn(0.03f, 0.16f)
+            for (c in PHYS_COLS.indices) {
+                if (n >= PhysTable.HC_MAX) break
+                val def = PHYS_COLS[c]
+                val a = b + def[0].toInt()
+                val e = b + def[1].toInt()
+                val t = def[2]
+                val ax = physPrevX[a] + (physCurX[a] - physPrevX[a]) * u
+                val az = physPrevZ[a] + (physCurZ[a] - physPrevZ[a]) * u
+                val ex = physPrevX[e] + (physCurX[e] - physPrevX[e]) * u
+                val ez = physPrevZ[e] + (physCurZ[e] - physPrevZ[e]) * u
+                phys.hcX[n] = ax + (ex - ax) * t
+                phys.hcZ[n] = az + (ez - az) * t
+                phys.hcVX[n] = physVelX[a] + (physVelX[e] - physVelX[a]) * t
+                phys.hcVZ[n] = physVelZ[a] + (physVelZ[e] - physVelZ[a]) * t
+                phys.hcR[n] = if (def[3] < 0.5f) fr else pr
+                phys.hcOwner[n] = h
+                n++
+            }
+        }
+        phys.hcN = n
+    }
+
+    /**
+     * Um passo do jogo de física: câmera da mesa, mão -> mesa, pegar e soltar (mão fechada), e a física em
+     * passos curtos (para a mão não "atravessar" os objetos quando se mexe rápido).
+     */
+    private fun stepPhys(iw: Float, ih: Float, seenHands: Int) {
+        val now = SystemClock.uptimeMillis()
+        if (!physInit) resetPhys()
+        val dt = if (physLastMs == 0L) 0.016f else ((now - physLastMs) / 1000f).coerceIn(0.001f, 0.05f)
+        physLastMs = now
+        updateGameCamera(dt, iw, ih)
+
+        val nh = min(seenHands, PHYS_HANDS)
+        for (h in 0 until MAX_HANDS) {
+            physHandOk[h] = if (h < nh) projectPhysHand(h, dt) else false
+        }
+
+        // Pegar e soltar. Pega quem fecha a mão (há pouco) com a palma em cima do objeto; abrir a mão solta.
+        for (h in 0 until MAX_HANDS) {
+            val fist = physHandOk[h] && gunOn[h]
+            if (fist && !physWasOn[h]) physCloseAt[h] = now
+            physWasOn[h] = fist
+            val held = physHeld[h]
+            if (held >= 0 && !fist) {
+                phys.release(held)
+                physHeld[h] = -1
+            } else if (held < 0 && fist && now - physCloseAt[h] <= PHYS_GRAB_MS) {
+                var best = -1
+                var bestD = Float.MAX_VALUE
+                val palmR = physHsT[h] * PHYS_PALM_R
+                for (i in 0..1) {
+                    if (phys.heldBy[i] >= 0) continue
+                    val d = hypot(phys.x[i] - physPalmX[h], phys.z[i] - physPalmZ[h])
+                    if (d <= phys.reach(i) + palmR * 0.8f && d < bestD) {
+                        best = i
+                        bestD = d
+                    }
+                }
+                if (best >= 0) {
+                    phys.grab(best, h)
+                    physHeld[h] = best
+                    physOffX[best] = (phys.x[best] - physPalmX[h]) * 0.5f
+                    physOffZ[best] = (phys.z[best] - physPalmZ[h]) * 0.5f
+                    physAngOff[best] = PhysTable.wrapAngle(phys.ang[best] - physHandAng[h])
+                }
+            }
+        }
+
+        // O que está na mão segue a palma (e vai se centralizando nela); gira junto com a mão.
+        val decay = exp(-dt * PHYS_CENTER_RATE)
+        for (i in 0..1) {
+            val h = phys.heldBy[i]
+            if (h >= 0) {
+                physOffX[i] *= decay
+                physOffZ[i] *= decay
+                phys.holdX[i] = physPalmX[h] + physOffX[i]
+                phys.holdZ[i] = physPalmZ[h] + physOffZ[i]
+                phys.holdAng[i] = physHandAng[h] + physAngOff[i]
+                phys.holdAngOn[i] = true
+            }
+            val liftTo = if (h >= 0) PHYS_LIFT else 0f
+            phys.lift[i] += (liftTo - phys.lift[i]) * min(1f, dt * 12f)
+        }
+
+        // Anel amarelo: mão aberta em cima do objeto (é só fechar para pegar).
+        physHover[0] = false
+        physHover[1] = false
+        for (h in 0 until PHYS_HANDS) {
+            if (!physHandOk[h] || gunOn[h] || physHeld[h] >= 0) continue
+            val palmR = physHsT[h] * PHYS_PALM_R
+            for (i in 0..1) {
+                if (phys.heldBy[i] >= 0) continue
+                val d = hypot(phys.x[i] - physPalmX[h], phys.z[i] - physPalmZ[h])
+                if (d <= phys.reach(i) + palmR * 0.8f) physHover[i] = true
+            }
+        }
+
+        // A física, em passos curtos.
+        val n = ((dt / PHYS_SUBSTEP) + 0.999f).toInt().coerceIn(1, 8)
+        val sdt = dt / n
+        for (s in 1..n) {
+            fillPhysColliders(s.toFloat() / n)
+            phys.substep(sdt)
+        }
+    }
+
+    /** Ponto k do contorno do corpo i no tampo (x e z do mundo da mesa, em hit2): 4 cantos do quadrado ou o círculo do disco. */
+    private fun physFootPoint(i: Int, k: Int) {
+        if (i == 0) {
+            val h = phys.size[0]
+            val c = cos(phys.ang[0])
+            val s = sin(phys.ang[0])
+            val lx = if (k == 0 || k == 3) -h else h
+            val lz = if (k < 2) -h else h
+            hit2[0] = phys.x[0] + lx * c - lz * s
+            hit2[1] = phys.z[0] + lx * s + lz * c
+        } else {
+            val a = k * TWO_PI_F / PHYS_DISC_SEGS
+            hit2[0] = phys.x[1] + cos(a) * phys.size[1]
+            hit2[1] = phys.z[1] + sin(a) * phys.size[1]
+        }
+    }
+
+    /** Pinta o contorno do corpo i deitado no tampo (para a sombra), deslocado de (dx, dz). */
+    private fun drawPhysFootprint(canvas: Canvas, i: Int, y: Float, dx: Float, dz: Float, color: Int) {
+        val n = if (i == 0) 4 else PHYS_DISC_SEGS
+        facePath.reset()
+        for (k in 0 until n) {
+            physFootPoint(i, k)
+            if (gameProject(hit2[0] + dx, y, hit2[1] + dz, sp) <= 0f) return
+            if (k == 0) facePath.moveTo(sp[0], sp[1]) else facePath.lineTo(sp[0], sp[1])
+        }
+        facePath.close()
+        fillPaint.color = color
+        canvas.drawPath(facePath, fillPaint)
+    }
+
+    /** Risquinho com uma bolinha no alto do corpo: mostra para onde ele está virado (para ver o giro). */
+    private fun drawPhysMark(canvas: Canvas, i: Int, y: Float) {
+        val len = phys.size[i] * 0.85f
+        val ex = phys.x[i] + cos(phys.ang[i]) * len
+        val ez = phys.z[i] + sin(phys.ang[i]) * len
+        if (gameProject(phys.x[i], y, phys.z[i], sp) <= 0f) return
+        val ax = sp[0]
+        val ay = sp[1]
+        if (gameProject(ex, y, ez, sp) <= 0f) return
+        arrowPaint.strokeWidth = max(panelW * 0.008f, 2f)
+        canvas.drawLine(ax, ay, sp[0], sp[1], arrowPaint)
+        fillPaint.color = Color.argb(235, 255, 255, 255)
+        canvas.drawCircle(sp[0], sp[1], max(panelW * 0.011f, 2f), fillPaint)
+    }
+
+    /** O quadrado: um bloco que gira (só as faces que olham para a câmera). */
+    private fun drawPhysSquare(canvas: Canvas) {
+        val base = gColors[0]
+        val y0 = phys.lift[0]
+        val y1 = y0 + PHYS_BODY_H
+        for (k in 0 until 4) {
+            physFootPoint(0, k)
+            physCX[k] = hit2[0]
+            physCZ[k] = hit2[1]
+        }
+        for (k in 0 until 4) {
+            val k2 = (k + 1) and 3
+            val mx = (physCX[k] + physCX[k2]) / 2f
+            val mz = (physCZ[k] + physCZ[k2]) / 2f
+            var nx = mx - phys.x[0]
+            var nz = mz - phys.z[0]
+            val nl = hypot(nx, nz)
+            if (nl < 1e-6f) continue
+            nx /= nl
+            nz /= nl
+            if (nx * (camE[0] - mx) + nz * (camE[2] - mz) <= 0f) continue        // essa lateral olha para longe
+            val f = (0.66f + 0.30f * (nx * 0.4f + nz * 0.7f)).coerceIn(0.42f, 0.95f)
+            quad(
+                canvas, shade(base, f), true,
+                physCX[k], y0, physCZ[k], physCX[k2], y0, physCZ[k2],
+                physCX[k2], y1, physCZ[k2], physCX[k], y1, physCZ[k]
+            )
+        }
+        quad(
+            canvas, shade(base, 1.0f), true,
+            physCX[0], y1, physCZ[0], physCX[1], y1, physCZ[1],
+            physCX[2], y1, physCZ[2], physCX[3], y1, physCZ[3]
+        )
+        drawPhysMark(canvas, 0, y1)
+    }
+
+    /** O disco: um cilindro baixo (lateral em fatias, tampa por cima). */
+    private fun drawPhysDisc(canvas: Canvas) {
+        val base = gColors[2]
+        val y0 = phys.lift[1]
+        val y1 = y0 + PHYS_BODY_H
+        val r = phys.size[1]
+        val n = PHYS_DISC_SEGS
+        gunPaint.strokeWidth = max(1f, panelW * 0.003f)
+        for (k in 0 until n) {
+            val a0 = k * TWO_PI_F / n
+            val a1 = (k + 1) * TWO_PI_F / n
+            val am = (a0 + a1) / 2f
+            val nx = cos(am)
+            val nz = sin(am)
+            if (nx * (camE[0] - (phys.x[1] + nx * r)) + nz * (camE[2] - (phys.z[1] + nz * r)) <= 0f) continue
+            val x0 = phys.x[1] + cos(a0) * r
+            val z0 = phys.z[1] + sin(a0) * r
+            val x1 = phys.x[1] + cos(a1) * r
+            val z1 = phys.z[1] + sin(a1) * r
+            val p0 = setQuadPoint(0, x0, y0, z0)
+            val p1 = setQuadPoint(1, x1, y0, z1)
+            val p2 = setQuadPoint(2, x1, y1, z1)
+            val p3 = setQuadPoint(3, x0, y1, z0)
+            if (!(p0 && p1 && p2 && p3)) continue
+            facePath.reset()
+            facePath.moveTo(pq[0], pq[1])
+            facePath.lineTo(pq[2], pq[3])
+            facePath.lineTo(pq[4], pq[5])
+            facePath.lineTo(pq[6], pq[7])
+            facePath.close()
+            val c = shade(base, (0.62f + 0.34f * (nx * 0.4f + nz * 0.7f)).coerceIn(0.42f, 0.95f))
+            fillPaint.color = c
+            canvas.drawPath(facePath, fillPaint)
+            gunPaint.color = c                       // contorno da mesma cor: tapa as frestinhas entre as fatias
+            canvas.drawPath(facePath, gunPaint)
+        }
+        // Tampa.
+        facePath.reset()
+        var ok = true
+        for (k in 0 until n) {
+            val a = k * TWO_PI_F / n
+            if (gameProject(phys.x[1] + cos(a) * r, y1, phys.z[1] + sin(a) * r, sp) <= 0f) {
+                ok = false
+                break
+            }
+            if (k == 0) facePath.moveTo(sp[0], sp[1]) else facePath.lineTo(sp[0], sp[1])
+        }
+        if (ok) {
+            facePath.close()
+            fillPaint.color = shade(base, 1.0f)
+            canvas.drawPath(facePath, fillPaint)
+            canvas.drawPath(facePath, outlinePaint)
+        }
+        drawPhysMark(canvas, 1, y1)
+    }
+
+    /** Anel amarelo no tampo em volta do corpo i (a mão aberta está em cima: é só fechar para segurar). */
+    private fun drawPhysRing(canvas: Canvas, i: Int) {
+        val steps = 28
+        val rw = phys.reach(i) * 1.15f
+        var ax = 0f
+        var ay = 0f
+        var have = false
+        for (k in 0..steps) {
+            val a = k * TWO_PI_F / steps
+            val d = gameProject(phys.x[i] + cos(a) * rw, 0.004f, phys.z[i] + sin(a) * rw, sp)
+            if (d > 0f && have) canvas.drawLine(ax, ay, sp[0], sp[1], gunRingPaint)
+            ax = sp[0]
+            ay = sp[1]
+            have = d > 0f
+        }
+    }
+
+    /** Janela do jogo de física: a mesa 3D com o quadrado e o disco, e uma dica do que fazer. */
+    private fun drawPhysPanel(canvas: Canvas) {
+        val bw = panelW
+        rect.set(panelLeft, panelTop, panelLeft + panelW, panelTop + panelH)
+        canvas.save()
+        canvas.clipRect(rect)
+        drawGameTable(canvas)
+        for (i in 0..1) {
+            val o = phys.lift[i] * 0.3f
+            drawPhysFootprint(canvas, i, 0.002f, o, o, Color.argb(85, 0, 0, 0))
+        }
+        // Do mais longe para o mais perto da câmera.
+        val d0 = gameProject(phys.x[0], PHYS_BODY_H / 2f, phys.z[0], sp)
+        val d1 = gameProject(phys.x[1], PHYS_BODY_H / 2f, phys.z[1], sp)
+        if (d0 >= d1) {
+            drawPhysSquare(canvas)
+            drawPhysDisc(canvas)
+        } else {
+            drawPhysDisc(canvas)
+            drawPhysSquare(canvas)
+        }
+        for (i in 0..1) if (physHover[i]) drawPhysRing(canvas, i)
+        canvas.restore()
+
+        var holding = false
+        for (h in 0 until MAX_HANDS) if (physHeld[h] >= 0) holding = true
+        var hover = false
+        if (physHover[0] || physHover[1]) hover = true
+        thinPaint.textAlign = Paint.Align.LEFT
+        thinPaint.color = Color.WHITE
+        thinPaint.textSize = bw * 0.055f
+        canvas.drawText("Física (teste)", panelLeft + bw * 0.04f, panelTop + bw * 0.092f, thinPaint)
+        thinPaint.textSize = bw * 0.034f
+        val tip: String
+        if (holding) {
+            thinPaint.color = Color.rgb(160, 235, 150)
+            tip = "Segurando. Abra a mão para soltar (ou arremessar)."
+        } else if (hover) {
+            thinPaint.color = Color.rgb(255, 235, 120)
+            tip = "Feche a mão para segurar."
+        } else {
+            thinPaint.color = Color.argb(200, 255, 255, 255)
+            tip = "Empurre com a mão. Feche em cima para segurar."
+        }
+        canvas.drawText(tip, panelLeft + bw * 0.04f, panelTop + bw * 0.145f, thinPaint)
+        thinPaint.color = Color.WHITE
+    }
+
     /** Menu de configurações: título, duas abas (Mão e Menu) e cartões para escolher. */
     private fun drawSettings(canvas: Canvas) {
         val bw = panelW
@@ -3217,7 +3669,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             canvas.translate(-cx, -cy)
         }
         // O jogo e o YouTube têm toques precisos: ficam retos.
-        val tilted = m != YOUTUBE_ICON && m != GAME_ICON && m != SHOOT_MENU &&
+        val tilted = m != YOUTUBE_ICON && m != GAME_ICON && m != SHOOT_MENU && m != PHYS_MENU &&
             beginTilt(canvas, panelLeft, panelTop, panelLeft + panelW, panelTop + panelH)
 
         val rad = gap * 2f
@@ -3242,6 +3694,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         if (m == SETTINGS_ICON) drawSettings(canvas)
         if (m == GAMES_ICON) drawGamesPanel(canvas)
         if (m == SHOOT_MENU) drawShootPanel(canvas)
+        if (m == PHYS_MENU) drawPhysPanel(canvas)
 
         if (menuLayout == LAYOUT_GRID) {
             drawPill(canvas, 1)
@@ -3442,12 +3895,13 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val DEPTH_PARALLAX = 0.02f   // efeito 3D no VR Box (fração da largura; 0 = desliga)
         const val DEPTH_LABEL_MS = 900L    // quanto tempo o texto "Distância" fica na tela
 
-        const val ICON_COUNT = 5     // menus: 0 a 2 têm ícone; 3 (Blocos) e 4 (Tiro) abrem pela lista de Jogos
+        const val ICON_COUNT = 6     // menus: 0 a 2 têm ícone; 3 (Blocos), 4 (Tiro) e 5 (Física) abrem pela lista de Jogos
         const val ICON_SHOWN = 3     // ícones que aparecem na janela (o jogo de blocos abre pela lista de Jogos)
         const val YOUTUBE_ICON = 1   // o ícone vermelho abre o YouTube
         const val SETTINGS_ICON = 0  // o ícone verde abre as configurações
         const val GAMES_ICON = 2     // o ícone azul abre a lista de jogos
         const val SHOOT_MENU = 4     // jogo de tiro (teste)
+        const val PHYS_MENU = 5      // jogo de física (teste)
         const val GUN_ON_FRAMES = 3  // quadros com a mão fechada para a pistola aparecer
         const val GUN_MAX_FACES = 400 // triângulos da pistola 3D
         // Pistola 9mm (PSX Firearms Free, heyheythere, CC BY 4.0): 244 triângulos. Formato: 2 bytes com a quantidade;
@@ -3463,6 +3917,56 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val GUN_GRAB_MS = 600L      // a mão que fechou há menos que isso, em cima da pistola, pega ela
         const val GUN_PALM_REACH = 0.35f  // quanto da palma (fração) conta além do tamanho da pistola, no "pegar"
         const val GAME_ICON = 3      // o ícone amarelo abre o jogo de empilhar blocos
+
+        // Jogo de física (teste). A física em si (atrito, quique, peso) fica no começo da classe PhysTable.
+        const val PHYS_HANDS = 2            // quantas mãos empurram os objetos
+        const val PHYS_PLANE_Y = 0.07f      // altura (em cima do tampo) em que a mão "toca" a mesa
+        const val PHYS_BODY_H = 0.12f       // altura do quadrado e do disco
+        const val PHYS_LIFT = 0.09f         // quanto o objeto sobe quando está na mão
+        const val PHYS_GRAB_MS = 600L       // a mão que fechou há menos que isso, em cima do objeto, segura ele
+        const val PHYS_SUBSTEP = 0.006f     // passo máximo da física (segundos)
+        const val PHYS_HAND_FOLLOW = 28f    // quão rápido os pontos da mão na mesa acompanham a detecção
+        const val PHYS_FINGER_R = 0.11f     // grossura do dedo (fração do tamanho da mão na mesa)
+        const val PHYS_PALM_R = 0.27f       // grossura da palma (idem)
+        const val PHYS_HS_MIN = 0.12f       // limites do tamanho da mão na mesa (unidades da mesa)
+        const val PHYS_HS_MAX = 0.60f
+        const val PHYS_CENTER_RATE = 3f     // objeto segurado vai se centralizando na palma (por segundo)
+        const val PHYS_DISC_SEGS = 24       // fatias do disco no desenho
+
+        /** Um colizor: entre os pontos a e b da mão, na fração t do caminho; k = 0 dedo (fino), 1 palma (grosso). */
+        private fun col(a: Int, b: Int, t: Float, k: Int): FloatArray = floatArrayOf(a.toFloat(), b.toFloat(), t, k.toFloat())
+
+        private fun buildPhysCols(): Array<FloatArray> {
+            val l = ArrayList<FloatArray>()
+            // Dedos: em cada osso, um colizor no começo e um no meio; mais um na ponta.
+            for (f in 0 until 5) {
+                val m = 1 + f * 4
+                for (s in 0 until 3) {
+                    l.add(col(m + s, m + s + 1, 0f, 0))
+                    l.add(col(m + s, m + s + 1, 0.5f, 0))
+                }
+                l.add(col(m + 3, m + 3, 0f, 0))
+            }
+            // Palma: o pulso, a base do polegar, os 4 nós dos dedos e pontos entre eles.
+            l.add(col(0, 0, 0f, 1))
+            l.add(col(1, 1, 0f, 1))
+            l.add(col(5, 5, 0f, 1))
+            l.add(col(9, 9, 0f, 1))
+            l.add(col(13, 13, 0f, 1))
+            l.add(col(17, 17, 0f, 1))
+            l.add(col(0, 5, 0.5f, 1))
+            l.add(col(0, 9, 0.5f, 1))
+            l.add(col(0, 13, 0.5f, 1))
+            l.add(col(0, 17, 0.5f, 1))
+            l.add(col(5, 9, 0.5f, 1))
+            l.add(col(9, 13, 0.5f, 1))
+            l.add(col(13, 17, 0.5f, 1))
+            l.add(col(0, 1, 0.5f, 1))
+            l.add(col(5, 13, 0.5f, 1))
+            return l.toTypedArray()
+        }
+
+        val PHYS_COLS: Array<FloatArray> = buildPhysCols()
 
         // Formatos da barra.
         const val LAYOUT_HORIZONTAL = 0
@@ -3518,5 +4022,395 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val ORBIT_ELEV_PER_PANEL = 1.5f
         const val PI_F = 3.1415927f
         const val TWO_PI_F = 6.2831855f
+    }
+}
+
+/**
+ * Física 2D do jogo "Física" (teste): um quadrado e um círculo (disco) deslizando numa mesa de lado 1,0
+ * (x e z vão de -0,5 a 0,5). Os dois têm posição, giro, velocidade e velocidade de giro, batem nas bordas da
+ * mesa, um no outro e nos "colizores" da mão (círculos que a tela preenche a cada quadro com os dedos e a palma).
+ * Uma mão fechada pode segurar um corpo: ele passa a seguir a mão (sem física própria) e, ao soltar, sai
+ * com a velocidade da mão (arremesso).
+ * Kotlin puro (sem Android), por isso dá para testar fora do celular.
+ */
+internal class PhysTable {
+    val x = FloatArray(2)
+    val z = FloatArray(2)
+    val vx = FloatArray(2)
+    val vz = FloatArray(2)
+    val ang = FloatArray(2)
+    val w = FloatArray(2)
+    val lift = FloatArray(2)                       // altura do corpo acima do tampo (quando segurado, sobe um pouco)
+    val size = floatArrayOf(SQ_HALF, DISC_R)       // metade do lado (quadrado) / raio (círculo)
+    private val im = floatArrayOf(1f / SQ_MASS, 1f / DISC_MASS)
+    private val ii = floatArrayOf(
+        1f / (SQ_MASS * (2f * SQ_HALF) * (2f * SQ_HALF) * 2f / 12f),
+        1f / (0.5f * DISC_MASS * DISC_R * DISC_R)
+    )
+
+    // Quem está segurando cada corpo (-1 = ninguém) e para onde ele deve ir.
+    val heldBy = intArrayOf(-1, -1)
+    val holdX = FloatArray(2)
+    val holdZ = FloatArray(2)
+    val holdAng = FloatArray(2)
+    val holdAngOn = BooleanArray(2)
+    private val holdVX = FloatArray(2)
+    private val holdVZ = FloatArray(2)
+    private val holdW = FloatArray(2)
+
+    // Colizores da mão (preenchidos de fora a cada passo): posição, raio, velocidade e de qual mão são.
+    var hcN = 0
+    val hcX = FloatArray(HC_MAX)
+    val hcZ = FloatArray(HC_MAX)
+    val hcR = FloatArray(HC_MAX)
+    val hcVX = FloatArray(HC_MAX)
+    val hcVZ = FloatArray(HC_MAX)
+    val hcOwner = IntArray(HC_MAX)
+
+    // Resultado de um contato (usado por vários testes).
+    private var cpX = 0f
+    private var cpZ = 0f
+    private var cnX = 0f
+    private var cnZ = 0f
+    private var cPen = 0f
+
+    fun reset() {
+        x[0] = -0.22f; z[0] = 0.10f; ang[0] = 0.35f
+        x[1] = 0.22f; z[1] = -0.05f; ang[1] = 0f
+        for (i in 0..1) {
+            vx[i] = 0f; vz[i] = 0f; w[i] = 0f; lift[i] = 0f
+            heldBy[i] = -1
+            holdVX[i] = 0f; holdVZ[i] = 0f; holdW[i] = 0f
+            holdAngOn[i] = false
+        }
+        hcN = 0
+    }
+
+    /** Raio usado para ver se a mão está "em cima" do corpo (o quadrado conta o canto). */
+    fun reach(i: Int): Float = if (i == 0) size[0] * 1.3f else size[1]
+
+    /** Passa a segurar o corpo i com a mão h. */
+    fun grab(i: Int, h: Int) {
+        heldBy[i] = h
+        vx[i] = 0f; vz[i] = 0f; w[i] = 0f
+        holdX[i] = x[i]; holdZ[i] = z[i]; holdAng[i] = ang[i]
+        holdVX[i] = 0f; holdVZ[i] = 0f; holdW[i] = 0f
+    }
+
+    /** Solta o corpo i: ele sai com a velocidade que vinha tendo na mão. */
+    fun release(i: Int) {
+        if (heldBy[i] < 0) return
+        heldBy[i] = -1
+        var sx = holdVX[i]
+        var sz = holdVZ[i]
+        val sp = hypot(sx, sz)
+        if (sp > MAX_SPEED) {
+            sx *= MAX_SPEED / sp
+            sz *= MAX_SPEED / sp
+        }
+        vx[i] = sx
+        vz[i] = sz
+        w[i] = holdW[i].coerceIn(-MAX_SPIN, MAX_SPIN)
+    }
+
+    /** Um passo curtinho (dt em segundos, uns 0,004 a 0,008). */
+    fun substep(dt: Float) {
+        // Corpos segurados: seguem o alvo da mão (suave) e guardam a velocidade, para o arremesso.
+        for (i in 0..1) {
+            if (heldBy[i] < 0) continue
+            val k = min(1f, dt * HOLD_FOLLOW)
+            val ox = x[i]
+            val oz = z[i]
+            x[i] += (holdX[i] - x[i]) * k
+            z[i] += (holdZ[i] - z[i]) * k
+            if (holdAngOn[i]) {
+                val oa = ang[i]
+                ang[i] += wrapAngle(holdAng[i] - ang[i]) * k
+                val iw = wrapAngle(ang[i] - oa) / dt
+                holdW[i] += (iw - holdW[i]) * min(1f, dt * 25f)
+            } else {
+                holdW[i] += (0f - holdW[i]) * min(1f, dt * 25f)
+            }
+            val lim = TABLE_HALF - reach(i)
+            x[i] = x[i].coerceIn(-lim, lim)
+            z[i] = z[i].coerceIn(-lim, lim)
+            val ivx = (x[i] - ox) / dt
+            val ivz = (z[i] - oz) / dt
+            holdVX[i] += (ivx - holdVX[i]) * min(1f, dt * 25f)
+            holdVZ[i] += (ivz - holdVZ[i]) * min(1f, dt * 25f)
+            vx[i] = holdVX[i]
+            vz[i] = holdVZ[i]
+            w[i] = holdW[i]
+        }
+
+        // Atrito da mesa e movimento dos corpos livres.
+        val damp = exp(-FRICTION * dt)
+        val wdamp = exp(-SPIN_FRICTION * dt)
+        for (i in 0..1) {
+            if (heldBy[i] >= 0) continue
+            vx[i] *= damp
+            vz[i] *= damp
+            w[i] *= wdamp
+            val sp = hypot(vx[i], vz[i])
+            if (sp > MAX_SPEED) {
+                vx[i] *= MAX_SPEED / sp
+                vz[i] *= MAX_SPEED / sp
+            }
+            if (sp < STOP_SPEED) { vx[i] = 0f; vz[i] = 0f }
+            if (abs(w[i]) < STOP_SPIN) w[i] = 0f
+            x[i] += vx[i] * dt
+            z[i] += vz[i] * dt
+            ang[i] = wrapAngle(ang[i] + w[i] * dt)
+        }
+
+        for (it in 0 until 2) {
+            for (i in 0..1) wallCollide(i)
+            bodyCollide()
+            for (c in 0 until hcN) {
+                for (i in 0..1) {
+                    if (heldBy[i] >= 0 && heldBy[i] == hcOwner[c]) continue    // a mão que segura não empurra o que segura
+                    handCollide(c, i)
+                }
+            }
+            for (i in 0..1) wallCollide(i)
+        }
+    }
+
+    // ---------- contatos ----------
+
+    /** Deixa o corpo i fora das bordas da mesa. */
+    private fun wallCollide(i: Int) {
+        if (heldBy[i] >= 0) return
+        if (i == 1) {
+            val r = size[1]
+            val lim = TABLE_HALF - r
+            if (x[1] < -lim) { x[1] = -lim; wallImpulse(1, 1f, 0f, -lim, z[1]) }
+            if (x[1] > lim) { x[1] = lim; wallImpulse(1, -1f, 0f, lim, z[1]) }
+            if (z[1] < -lim) { z[1] = -lim; wallImpulse(1, 0f, 1f, x[1], -lim) }
+            if (z[1] > lim) { z[1] = lim; wallImpulse(1, 0f, -1f, x[1], lim) }
+            return
+        }
+        // Quadrado: vê os 4 cantos contra cada borda.
+        val c = cos(ang[0])
+        val s = sin(ang[0])
+        val h = size[0]
+        for (k in 0 until 4) {
+            val lx = if (k == 0 || k == 3) -h else h
+            val lz = if (k < 2) -h else h
+            val px = x[0] + lx * c - lz * s
+            val pz = z[0] + lx * s + lz * c
+            if (px < -TABLE_HALF) { x[0] += -TABLE_HALF - px; wallImpulse(0, 1f, 0f, px, pz) }
+            if (px > TABLE_HALF) { x[0] -= px - TABLE_HALF; wallImpulse(0, -1f, 0f, px, pz) }
+            if (pz < -TABLE_HALF) { z[0] += -TABLE_HALF - pz; wallImpulse(0, 0f, 1f, px, pz) }
+            if (pz > TABLE_HALF) { z[0] -= pz - TABLE_HALF; wallImpulse(0, 0f, -1f, px, pz) }
+        }
+    }
+
+    private fun wallImpulse(i: Int, nx: Float, nz: Float, px: Float, pz: Float) {
+        // Para o disco o ponto de contato é o próprio centro (sem giro); para o quadrado é o canto.
+        val rx = if (i == 1) 0f else px - x[i]
+        val rz = if (i == 1) 0f else pz - z[i]
+        impulse(i, -1, nx, nz, rx, rz, 0f, 0f, 0f, 0f, 0f, WALL_E)
+    }
+
+    /** Quadrado contra disco. */
+    private fun bodyCollide() {
+        // Contato disco -> quadrado: ponto mais perto do disco dentro do quadrado.
+        if (!circleVsBox(x[1], z[1], size[1], 0)) return
+        // cnX/cnZ apontam do quadrado para o disco; cpX/cpZ é o ponto no quadrado.
+        val pen = cPen
+        val nx = cnX
+        val nz = cnZ
+        val px = cpX
+        val pz = cpZ
+        val im0 = if (heldBy[0] >= 0) 0f else im[0]
+        val im1 = if (heldBy[1] >= 0) 0f else im[1]
+        val tot = im0 + im1
+        if (tot <= 0f) return
+        x[1] += nx * pen * (im1 / tot)
+        z[1] += nz * pen * (im1 / tot)
+        x[0] -= nx * pen * (im0 / tot)
+        z[0] -= nz * pen * (im0 / tot)
+        // Impulso: disco (A) contra quadrado (B), normal aponta do quadrado para o disco.
+        val rAx = 0f
+        val rAz = 0f
+        val rBx = px - x[0]
+        val rBz = pz - z[0]
+        impulse(1, 0, nx, nz, rAx, rAz, rBx, rBz, 0f, 0f, 0f, BODY_E)
+    }
+
+    /**
+     * Um círculo (cx, cz, r) toca o quadrado `bi`? Se sim, preenche cpX/cpZ (ponto do quadrado mais perto do círculo),
+     * cnX/cnZ (normal, do quadrado para o círculo) e cPen (quanto entrou). Só serve para o quadrado (bi = 0).
+     */
+    private fun circleVsBox(cx: Float, cz: Float, r: Float, bi: Int): Boolean {
+        val c = cos(ang[bi])
+        val s = sin(ang[bi])
+        val dx = cx - x[bi]
+        val dz = cz - z[bi]
+        // Para o referencial do quadrado.
+        val lx = dx * c + dz * s
+        val lz = -dx * s + dz * c
+        val h = size[bi]
+        val qx = lx.coerceIn(-h, h)
+        val qz = lz.coerceIn(-h, h)
+        val ddx = lx - qx
+        val ddz = lz - qz
+        val dist = sqrt(ddx * ddx + ddz * ddz)
+        val nlx: Float
+        val nlz: Float
+        val pen: Float
+        var pqx = qx
+        var pqz = qz
+        if (dist > 1e-6f) {
+            if (dist >= r) return false
+            nlx = ddx / dist
+            nlz = ddz / dist
+            pen = r - dist
+        } else {
+            // O centro está dentro do quadrado: sai pela face mais perto.
+            val ex = h - abs(lx)
+            val ez = h - abs(lz)
+            if (ex < ez) {
+                nlx = if (lx >= 0f) 1f else -1f
+                nlz = 0f
+                pqx = nlx * h
+                pqz = lz
+                pen = ex + r
+            } else {
+                nlx = 0f
+                nlz = if (lz >= 0f) 1f else -1f
+                pqx = lx
+                pqz = nlz * h
+                pen = ez + r
+            }
+        }
+        // De volta ao mundo.
+        cnX = nlx * c - nlz * s
+        cnZ = nlx * s + nlz * c
+        cpX = x[bi] + pqx * c - pqz * s
+        cpZ = z[bi] + pqx * s + pqz * c
+        cPen = pen
+        return true
+    }
+
+    /** Colizor da mão c contra o corpo i (a mão não tem massa: só empurra). */
+    private fun handCollide(c: Int, i: Int) {
+        val hr = hcR[c]
+        if (i == 1) {
+            val dx = x[1] - hcX[c]
+            val dz = z[1] - hcZ[c]
+            val d = hypot(dx, dz)
+            val rr = size[1] + hr
+            if (d >= rr) return
+            val nx: Float
+            val nz: Float
+            if (d > 1e-6f) { nx = dx / d; nz = dz / d } else { nx = 1f; nz = 0f }
+            val pen = rr - d
+            if (heldBy[1] < 0) {
+                x[1] += nx * pen
+                z[1] += nz * pen
+            }
+            impulse(1, -1, nx, nz, 0f, 0f, 0f, 0f, hcVX[c], hcVZ[c], 0f, HAND_E)
+        } else {
+            if (!circleVsBox(hcX[c], hcZ[c], hr, 0)) return
+            // Normal do quadrado para a mão; o quadrado é empurrado para o lado contrário.
+            val nx = -cnX
+            val nz = -cnZ
+            if (heldBy[0] < 0) {
+                x[0] += nx * cPen
+                z[0] += nz * cPen
+            }
+            val rx = cpX - x[0]
+            val rz = cpZ - z[0]
+            impulse(0, -1, nx, nz, rx, rz, 0f, 0f, hcVX[c], hcVZ[c], 0f, HAND_E)
+        }
+    }
+
+    /**
+     * Impulso no corpo a (e, se b >= 0, também no b). A normal (nx, nz) aponta para o corpo a, vinda do outro.
+     * (rax, raz) = do centro de a ao ponto de contato; o mesmo para b (rbx, rbz). vox, voz = velocidade de quem
+     * empurra (a mão ou a parede), usada quando b < 0.
+     */
+    private fun impulse(
+        a: Int, b: Int, nx: Float, nz: Float,
+        rax: Float, raz: Float, rbx: Float, rbz: Float,
+        vox: Float, voz: Float, unused: Float, e: Float
+    ) {
+        val ima = if (heldBy[a] >= 0) 0f else im[a]
+        val iia = if (heldBy[a] >= 0) 0f else ii[a]
+        // Velocidade do ponto de contato em a.
+        val vax = vx[a] - w[a] * raz
+        val vaz = vz[a] + w[a] * rax
+        var vbx = vox
+        var vbz = voz
+        var imb = 0f
+        var iib = 0f
+        if (b >= 0) {
+            imb = if (heldBy[b] >= 0) 0f else im[b]
+            iib = if (heldBy[b] >= 0) 0f else ii[b]
+            vbx = vx[b] - w[b] * rbz
+            vbz = vz[b] + w[b] * rbx
+        }
+        val rvx = vax - vbx
+        val rvz = vaz - vbz
+        val vn = rvx * nx + rvz * nz
+        if (vn >= 0f) return                       // já estão se afastando
+        val crA = rax * nz - raz * nx
+        val crB = rbx * nz - rbz * nx
+        val den = ima + imb + crA * crA * iia + crB * crB * iib
+        if (den <= 1e-9f) return
+        val j = -(1f + e) * vn / den
+        applyImpulse(a, nx * j, nz * j, rax, raz, ima, iia)
+        if (b >= 0) applyImpulse(b, -nx * j, -nz * j, rbx, rbz, imb, iib)
+        // Atrito no contato (freia o deslizar de lado e dá giro).
+        val tx = -nz
+        val tz = nx
+        val rvx2 = (vx[a] - w[a] * raz) - (if (b >= 0) vx[b] - w[b] * rbz else vox)
+        val rvz2 = (vz[a] + w[a] * rax) - (if (b >= 0) vz[b] + w[b] * rbx else voz)
+        val vt = rvx2 * tx + rvz2 * tz
+        val crAt = rax * tz - raz * tx
+        val crBt = rbx * tz - rbz * tx
+        val dent = ima + imb + crAt * crAt * iia + crBt * crBt * iib
+        if (dent <= 1e-9f) return
+        var jt = -vt / dent
+        val lim = CONTACT_MU * j
+        jt = jt.coerceIn(-lim, lim)
+        applyImpulse(a, tx * jt, tz * jt, rax, raz, ima, iia)
+        if (b >= 0) applyImpulse(b, -tx * jt, -tz * jt, rbx, rbz, imb, iib)
+    }
+
+    private fun applyImpulse(i: Int, jx: Float, jz: Float, rx: Float, rz: Float, imi: Float, iii: Float) {
+        if (imi <= 0f && iii <= 0f) return
+        vx[i] += jx * imi
+        vz[i] += jz * imi
+        w[i] += (rx * jz - rz * jx) * iii
+    }
+
+    companion object {
+        const val TABLE_HALF = 0.5f
+        const val SQ_HALF = 0.10f
+        const val DISC_R = 0.11f
+        const val SQ_MASS = 1.0f
+        const val DISC_MASS = 0.8f
+        const val HC_MAX = 160
+        const val FRICTION = 2.4f          // atrito com a mesa (maior = para mais rápido)
+        const val SPIN_FRICTION = 3.0f     // atrito do giro
+        const val STOP_SPEED = 0.01f
+        const val STOP_SPIN = 0.05f
+        const val MAX_SPEED = 3.5f         // velocidade máxima (mesa por segundo)
+        const val MAX_SPIN = 14f
+        const val WALL_E = 0.35f           // quique na borda da mesa
+        const val BODY_E = 0.45f           // quique do quadrado contra o disco
+        const val HAND_E = 0.12f           // quique na mão (baixo: a mão "empurra" mais do que "bate")
+        const val CONTACT_MU = 0.35f       // atrito nos contatos
+        const val HOLD_FOLLOW = 28f        // quão rápido o corpo segurado acompanha a mão
+
+        fun wrapAngle(a: Float): Float {
+            var r = a
+            while (r > 3.1415927f) r -= 6.2831855f
+            while (r < -3.1415927f) r += 6.2831855f
+            return r
+        }
     }
 }
