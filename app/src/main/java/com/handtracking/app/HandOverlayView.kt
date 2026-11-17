@@ -464,8 +464,8 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     // Câmera do jogo: gira em volta da mesa. O lado de onde você olha vem da cabeça + do arrastar.
     private var camYawManual = GAME_YAW0
     private var camElevManual = GAME_ELEV0
-    private var camYaw = GAME_YAW0
-    private var camElev = GAME_ELEV0
+    private var camYaw = 0f             // para onde você olha (giro para a direita, radianos); vem da cabeça, se houver giroscópio
+    private var camElev = FP_PITCH0     // quanto você olha para baixo (radianos)
     private var headRefReady = false
     private var headYawAcc = 0f
     private var headYawLast = 0f
@@ -503,6 +503,10 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         color = Color.argb(42, 90, 60, 30)
     }
 
+    private var backCX = 0f              // botão de voltar (jogos de mesa), no canto de cima à esquerda
+    private var backCY = 0f
+    private var backR = 0f
+    private var backTouch = false
     private var resetCX = 0f
     private var resetCY = 0f
     private var resetR = 0f
@@ -752,7 +756,16 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     private fun isGameOpen(): Boolean = openMenu == GAME_ICON
 
     /** Menus que mostram uma mesa 3D: o jogo de blocos, o de tiro e o de física. */
-    private fun isTableOpen(): Boolean = openMenu == GAME_ICON || openMenu == SHOOT_MENU || openMenu == PHYS_MENU
+    private fun isTableMenu(m: Int): Boolean = m == GAME_ICON || m == SHOOT_MENU || m == PHYS_MENU
+
+    /** Um jogo de mesa está aberto: a mesa aparece na frente de você, sem janela, e a barra de ícones some. */
+    private fun isTableOpen(): Boolean = isTableMenu(openMenu)
+
+    /** Tamanho de referência dos textos dos jogos (a "janela" agora é a tela toda). */
+    private fun hudW(): Float = min(imgW, imgH) * 0.68f
+    private fun hudX(): Float = backCX + backR * 1.8f
+    private fun hudY1(): Float = backCY + hudW() * 0.02f
+    private fun hudY2(): Float = hudY1() + hudW() * 0.058f
 
     /** O menu vermelho mostra o YouTube (nos dois modos). */
     private fun isWebOpen(): Boolean = openMenu == YOUTUBE_ICON
@@ -975,6 +988,19 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             resetR = panelW * 0.05f
             resetCX = panelLeft + panelW - panelW * 0.075f
             resetCY = panelTop + panelW * 0.075f
+            if (isTableOpen()) {
+                // Mesa na frente de você: a "janela" é a tela inteira (sem vidro nem barrinhas) e os botões ficam nos cantos.
+                panelLeft = 0f
+                panelTop = 0f
+                panelW = iw
+                panelH = ih
+                backR = u * 0.045f
+                backCX = u * 0.075f
+                backCY = u * 0.075f
+                resetR = backR
+                resetCX = iw - u * 0.075f
+                resetCY = u * 0.075f
+            }
             // Abas e cartões de escolha do menu de configurações.
             val pad = panelW * 0.05f
             val cnt = optCount()
@@ -1061,14 +1087,17 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         if (isTableOpen()) headRefReady = false                                     // olhar daqui é o lado "de frente"
         if (openMenu == SHOOT_MENU || openMenu == PHYS_MENU) {
             // A mesa do tiro e a da física sempre abrem no ângulo inicial, com os objetos no lugar.
-            camYawManual = GAME_YAW0
-            camElevManual = GAME_ELEV0
-            camYaw = GAME_YAW0
-            camElev = GAME_ELEV0
             if (openMenu == SHOOT_MENU) resetShoot() else resetPhys()
         }
         if (openMenu == GAMES_ICON) scanGames()                                     // vê de novo o que está instalado
-        if (isTableOpen() && !panelMoved[openMenu]) lowerBarForGame(iw, ih)
+        if (isTableOpen()) {
+            // A mesa fica na frente de você, na distância normal (nada de menu afastado ou aproximado).
+            camYaw = 0f
+            camElev = FP_PITCH0
+            depthTarget = 1f
+            depthZ = 1f
+            grabbed = NONE
+        }
     }
 
     /** Escolheu um item da lista do •••. */
@@ -1189,6 +1218,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         popTouch[1] = false
         dotTouch = false
         resetTouch = false
+        backTouch = false
         var handleTouch = false
         var pHandleTouch = false
         pinchCount = 0
@@ -1225,15 +1255,17 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 val rawFy = hand[INDEX_TIP].y() * ih
                 val fx = layoutX(rawFx)
                 val fy = layoutY(rawFy)
-                for (i in 0 until ICON_SHOWN) {
+                val tableUi = isTableOpen()      // jogo de mesa: a barra de ícones e as barrinhas somem, não tocam em nada
+                if (!tableUi) for (i in 0 until ICON_SHOWN) {
                     if (abs(fx - iconCX[i]) <= iconS * 0.55f && abs(fy - iconCY[i]) <= iconS * 0.55f) {
                         iconTouch[i] = true
                     }
                 }
-                if (abs(fx - handleCX) <= handleW / 2f && abs(fy - handleCY) <= iconS * 0.5f) {
+                if (!tableUi && abs(fx - handleCX) <= handleW / 2f && abs(fy - handleCY) <= iconS * 0.5f) {
                     handleTouch = true
                 }
-                if (menuLayout == LAYOUT_GRID) {
+                if (tableUi && hypot(fx - backCX, fy - backCY) <= backR * 1.5f) backTouch = true
+                if (menuLayout == LAYOUT_GRID && !tableUi) {
                     for (w in 0..1) {
                         if (w == 1 && openMenu == NONE) continue
                         if (abs(fx - pillCX[w]) <= pillW / 2f && abs(fy - pillCY[w]) <= pillH) pillTouch[w] = true
@@ -1300,6 +1332,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             grabbed = NONE
             gameHeld = -1
         }
+        if (grabbed == TABLE_BACK && !isTableOpen()) grabbed = NONE
         if (grabbed == APP_TILE && (openMenu != GAMES_ICON || tileHeld < 0)) {
             grabbed = NONE
             tileHeld = -1
@@ -1325,7 +1358,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             var bestDist = Float.MAX_VALUE
             var bestIdx = -1
             val reach = iconS * 0.65f
-            for (p in 0 until pinchCount) {
+            if (!isTableOpen()) for (p in 0 until pinchCount) {
                 val px = pinchX[p]
                 val py = pinchY[p]
                 for (i in 0 until ICON_SHOWN) {
@@ -1427,10 +1460,16 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     if (best != NONE) break
                 }
             }
-            if (best == NONE && isGameOpen()) {
-                // Pinça no botão de reiniciar, num bloco, ou na mesa (pinça e arrastar gira a mesa).
+            if (best == NONE && isTableOpen()) {
+                // Pinça no botão de voltar (todos os jogos de mesa) e, no jogo de blocos, no de reiniciar ou num bloco.
                 val tol = iconS * 0.15f
                 for (p in 0 until pinchCount) {
+                    if (hypot(pinchX[p] - backCX, pinchY[p] - backCY) <= backR * 1.6f) {
+                        best = TABLE_BACK
+                        bestIdx = p
+                        break
+                    }
+                    if (!isGameOpen()) continue
                     if (abs(pinchX[p] - resetCX) <= resetR * 1.4f && abs(pinchY[p] - resetCY) <= resetR * 1.4f) {
                         best = GAME_RESET
                         bestIdx = p
@@ -1441,13 +1480,6 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                         best = GAME_BLOCK
                         bestIdx = p
                         gameHeld = b
-                        break
-                    }
-                    if (pinchX[p] >= panelLeft && pinchX[p] <= panelLeft + panelW &&
-                        pinchY[p] >= panelTop && pinchY[p] <= panelTop + panelH
-                    ) {
-                        best = GAME_ORBIT
-                        bestIdx = p
                         break
                     }
                 }
@@ -1535,6 +1567,11 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     SystemClock.uptimeMillis() - grabStartTime <= TAP_MAX_MS
                 ) {
                     resetGame()
+                }
+                if (grabbed == TABLE_BACK && !tapCancelled &&
+                    SystemClock.uptimeMillis() - grabStartTime <= TAP_MAX_MS
+                ) {
+                    toggleMenu(GAMES_ICON, iw, ih)      // pinça rápida no botão de voltar: volta para a lista de Jogos
                 }
                 if (grabbed == GAME_BLOCK) {
                     gameHeld = -1   // soltou: o bloco cai
@@ -1713,7 +1750,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
         // Menu: abre e fecha suavemente. O YouTube (que é uma janela de verdade por cima) abre e fecha na hora.
         if (openMenu != NONE) {
-            if (openMenu == YOUTUBE_ICON) {
+            if (openMenu == YOUTUBE_ICON || isTableOpen()) {
                 shownMenu = openMenu
                 panelAnim = 1f
             } else {
@@ -1725,7 +1762,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 if (panelAnim > 0.995f) panelAnim = 1f 
             }
         } else if (shownMenu != NONE) {
-            if (shownMenu == YOUTUBE_ICON) {
+            if (shownMenu == YOUTUBE_ICON || isTableMenu(shownMenu)) {
                 shownMenu = NONE
                 panelAnim = 0f
             } else {
@@ -1737,7 +1774,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             }
         }
         if (popFor == 1 && openMenu == NONE) popFor = -1
-        if (shownMenu != NONE && shownMenu != YOUTUBE_ICON && panelAnim in 0.005f..0.995f) moving = true
+        if (shownMenu != NONE && shownMenu != YOUTUBE_ICON && !isTableMenu(shownMenu) && panelAnim in 0.005f..0.995f) moving = true
         animating = moving
     }
 
@@ -1759,19 +1796,22 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         gameReady = true
         gameLastMs = 0L
         gameTower = 0
-        camYawManual = GAME_YAW0
-        camElevManual = GAME_ELEV0
-        camYaw = GAME_YAW0
-        camElev = GAME_ELEV0
+        camYaw = 0f
+        camElev = FP_PITCH0
         headRefReady = false
     }
 
     // ---------- câmera e projeção ----------
 
-    /** Atualiza a câmera: a cabeça (se houver sensor) e o arrastar da mesa decidem de que lado você olha. */
+    /**
+     * Câmera em primeira pessoa: seus olhos ficam parados um pouco acima e à frente da mesa, olhando para baixo, e
+     * a imagem da câmera do celular aparece atrás (a mesa fica "em cima" do mundo de verdade). Se houver giroscópio,
+     * virar a cabeça mexe a câmera da mesa e ela fica parada no mesmo lugar do mundo; sem giroscópio, a mesa fica
+     * parada na tela. A mesa tem lado 1,0 e o tampo é y = 0; x = direita, z = em sua direção.
+     */
     private fun updateGameCamera(dt: Float, iw: Float, ih: Float) {
-        var yawTarget = camYawManual
-        var elevTarget = camElevManual
+        var yawTarget = 0f
+        var pitchTarget = FP_PITCH0
         if (rot != null) {
             unproject(iw * 0.5f, ih * 0.5f, iw, ih, tmp3)       // para onde você olha, no mundo
             val hy = atan2(tmp3[0], tmp3[1])
@@ -1787,43 +1827,37 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             while (d < -PI_F) d += TWO_PI_F
             headYawAcc += d
             headYawLast = hy
-            // Virar a cabeça para a direita leva a câmera para o lado esquerdo da mesa (você "contorna" a mesa).
-            yawTarget = camYawManual - headYawAcc * HEAD_GAIN
-            // Olhar mais para baixo = ver a mesa mais de cima.
-            elevTarget = camElevManual + (headPitch0 - hp)
+            // Virar a cabeça para a direita: a câmera da mesa gira para a direita (a mesa sai para a esquerda da tela).
+            yawTarget = headYawAcc * HEAD_GAIN
+            // Olhar mais para baixo = a câmera inclina mais para baixo.
+            pitchTarget = FP_PITCH0 + (headPitch0 - hp)
         }
-        elevTarget = elevTarget.coerceIn(GAME_ELEV_MIN, GAME_ELEV_MAX)
+        pitchTarget = pitchTarget.coerceIn(0.05f, 1.3f)
         val k = min(1f, dt * 10f)
         camYaw += (yawTarget - camYaw) * k
-        camElev += (elevTarget - camElev) * k
+        camElev += (pitchTarget - camElev) * k
 
-        val ce = cos(camElev)
-        val se = sin(camElev)
+        val cp = cos(camElev)
+        val sn = sin(camElev)
         val sy = sin(camYaw)
         val cy = cos(camYaw)
-        camE[0] = GAME_DIST * sy * ce
-        camE[1] = GAME_TARGET_Y + GAME_DIST * se
-        camE[2] = GAME_DIST * cy * ce
-        camF[0] = -sy * ce
-        camF[1] = -se
-        camF[2] = -cy * ce
-        var rx = -camF[2]
-        var rz = camF[0]
-        val rn = sqrt(rx * rx + rz * rz)
-        if (rn > 1e-6f) {
-            rx /= rn
-            rz /= rn
-        }
-        camR[0] = rx
+        camE[0] = 0f
+        camE[1] = FP_EYE_Y
+        camE[2] = FP_EYE_Z
+        camF[0] = sy * cp
+        camF[1] = -sn
+        camF[2] = -cy * cp
+        camR[0] = cy
         camR[1] = 0f
-        camR[2] = rz
-        camU[0] = -rz * camF[1]
-        camU[1] = rz * camF[0] - rx * camF[2]
-        camU[2] = rx * camF[1]
+        camR[2] = sy
+        camU[0] = sy * sn
+        camU[1] = cp
+        camU[2] = -cy * sn
 
+        // A tela toda é a "janela" da mesa, com a mesma abertura da câmera do celular (a mesa fica no tamanho certo).
         vpCX = panelLeft + panelW / 2f
-        vpCY = panelTop + panelH * 0.38f       // a mesa fica mais alta na janela: embaixo cabem as pernas
-        vpF = panelW * GAME_SCALE * GAME_DIST
+        vpCY = panelTop + panelH / 2f
+        vpF = focal(iw, ih)
     }
 
     /** Ponto da cena -> ponto na tela (em out). Devolve a distância até a câmera, ou -1 se estiver atrás dela. */
@@ -2244,7 +2278,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
     /** Desenha mesa, sombras, blocos, placar e o botão de reiniciar dentro do menu do jogo. */
     private fun drawGame(canvas: Canvas) {
-        val bw = panelW
+        val bw = hudW()
         rect.set(panelLeft, panelTop, panelLeft + panelW, panelTop + panelH)
         canvas.save()
         canvas.clipRect(rect)
@@ -2295,13 +2329,13 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         textPaint.textAlign = Paint.Align.LEFT
         textPaint.color = Color.WHITE
         val label = if (gameTower >= GAME_BLOCKS) "Torre completa!" else "Torre: $gameTower/$GAME_BLOCKS"
-        canvas.drawText(label, panelLeft + bw * 0.04f, panelTop + bw * 0.092f, textPaint)
+        canvas.drawText(label, hudX(), hudY1(), textPaint)
         textPaint.textAlign = Paint.Align.RIGHT
-        canvas.drawText("Recorde: $gameBest", resetCX - resetR * 1.5f, panelTop + bw * 0.092f, textPaint)
+        canvas.drawText("Recorde: $gameBest", resetCX - resetR * 1.5f, hudY1(), textPaint)
         textPaint.textSize = bw * 0.034f
         textPaint.textAlign = Paint.Align.LEFT
         textPaint.color = Color.argb(190, 255, 255, 255)
-        canvas.drawText("Vire a cabeça ou arraste a mesa para girar", panelLeft + bw * 0.04f, panelTop + bw * 0.145f, textPaint)
+        canvas.drawText("Pinça num bloco para pegar e soltar", hudX(), hudY2(), textPaint)
         textPaint.color = Color.WHITE
 
         // Botão de reiniciar (círculo com uma seta).
@@ -2329,6 +2363,21 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         arrowPath.close()
         fillPaint.color = Color.rgb(40, 40, 40)
         canvas.drawPath(arrowPath, fillPaint)
+    }
+
+    /** Botão de voltar (canto de cima à esquerda dos jogos de mesa): círculo claro com uma setinha. */
+    private fun drawTableBack(canvas: Canvas) {
+        fillPaint.color = when {
+            grabbed == TABLE_BACK -> Color.YELLOW
+            backTouch -> Color.WHITE
+            else -> Color.argb(215, 235, 235, 235)
+        }
+        canvas.drawCircle(backCX, backCY, backR, fillPaint)
+        canvas.drawCircle(backCX, backCY, backR, glassRingPaint)
+        val k = backR * 0.34f
+        arrowPaint.strokeWidth = max(backR * 0.2f, 2f)
+        canvas.drawLine(backCX + k * 0.5f, backCY - k, backCX - k * 0.5f, backCY, arrowPaint)
+        canvas.drawLine(backCX - k * 0.5f, backCY, backCX + k * 0.5f, backCY + k, arrowPaint)
     }
 
     /** Controle de videogame (ícone de Jogos). */
@@ -2906,7 +2955,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
     /** Janela do jogo de tiro: a mesa 3D com a pistola em cima, e uma dica do que fazer. */
     private fun drawShootPanel(canvas: Canvas) {
-        val bw = panelW
+        val bw = hudW()
         rect.set(panelLeft, panelTop, panelLeft + panelW, panelTop + panelH)
         canvas.save()
         canvas.clipRect(rect)
@@ -2935,7 +2984,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         thinPaint.textAlign = Paint.Align.LEFT
         thinPaint.color = Color.WHITE
         thinPaint.textSize = bw * 0.055f
-        canvas.drawText("Tiro (teste)", panelLeft + bw * 0.04f, panelTop + bw * 0.092f, thinPaint)
+        canvas.drawText("Tiro (teste)", hudX(), hudY1(), thinPaint)
         thinPaint.textSize = bw * 0.034f
         val tip: String
         if (gunHeld >= 0) {
@@ -2948,7 +2997,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             thinPaint.color = Color.argb(200, 255, 255, 255)
             tip = "Leve a mão até a pistola e feche."
         }
-        canvas.drawText(tip, panelLeft + bw * 0.04f, panelTop + bw * 0.145f, thinPaint)
+        canvas.drawText(tip, hudX(), hudY2(), thinPaint)
         thinPaint.color = Color.argb(170, 255, 255, 255)
         thinPaint.textSize = bw * 0.026f
         canvas.drawText("Pistola: PSX Firearms Free, heyheythere (CC BY 4.0)", panelLeft + bw * 0.04f, panelTop + panelH - bw * 0.025f, thinPaint)
@@ -3299,7 +3348,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
     /** Janela do jogo de física: a mesa 3D com o quadrado e o disco, e uma dica do que fazer. */
     private fun drawPhysPanel(canvas: Canvas) {
-        val bw = panelW
+        val bw = hudW()
         rect.set(panelLeft, panelTop, panelLeft + panelW, panelTop + panelH)
         canvas.save()
         canvas.clipRect(rect)
@@ -3328,7 +3377,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         thinPaint.textAlign = Paint.Align.LEFT
         thinPaint.color = Color.WHITE
         thinPaint.textSize = bw * 0.055f
-        canvas.drawText("Física (teste)", panelLeft + bw * 0.04f, panelTop + bw * 0.092f, thinPaint)
+        canvas.drawText("Física (teste)", hudX(), hudY1(), thinPaint)
         thinPaint.textSize = bw * 0.034f
         val tip: String
         if (holding) {
@@ -3341,7 +3390,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             thinPaint.color = Color.argb(200, 255, 255, 255)
             tip = "Empurre com a mão. Feche em cima para segurar."
         }
-        canvas.drawText(tip, panelLeft + bw * 0.04f, panelTop + bw * 0.145f, thinPaint)
+        canvas.drawText(tip, hudX(), hudY2(), thinPaint)
         thinPaint.color = Color.WHITE
     }
 
@@ -3500,10 +3549,12 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             canvas.scale(dScale, dScale)
             canvas.translate(-pvX, -pvY)
             drawPanel(canvas)
-            val homeTilt = menuLayout == LAYOUT_GRID && beginTilt(canvas, barLeft, barTop, barLeft + barW, barTop + barH)
-            drawBar(canvas)
-            for (i in 0 until ICON_SHOWN) drawIcon(canvas, i)
-            if (homeTilt) canvas.restore()
+            if (!isTableOpen()) {
+                val homeTilt = menuLayout == LAYOUT_GRID && beginTilt(canvas, barLeft, barTop, barLeft + barW, barTop + barH)
+                drawBar(canvas)
+                for (i in 0 until ICON_SHOWN) drawIcon(canvas, i)
+                if (homeTilt) canvas.restore()
+            }
             drawPopover(canvas)
             // Anel amarelo no ponto onde a pinça está fechada.
             for (p in 0 until pinchCount) {
@@ -3762,6 +3813,14 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     private fun drawPanel(canvas: Canvas) {
         val m = shownMenu
         if (m == NONE) return
+        if (isTableMenu(m)) {
+            // Jogos de mesa: a mesa aparece direto na frente de você (sem janela de vidro, sem barrinhas).
+            if (m == GAME_ICON) drawGame(canvas)
+            if (m == SHOOT_MENU) drawShootPanel(canvas)
+            if (m == PHYS_MENU) drawPhysPanel(canvas)
+            drawTableBack(canvas)
+            return
+        }
         val animated = m != YOUTUBE_ICON && panelAnim < 0.999f
         if (animated) {
             val pad = gap * 3f
@@ -4026,6 +4085,11 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val GUN_PALM_REACH = 0.35f  // quanto da palma (fração) conta além do tamanho da pistola, no "pegar"
         const val GAME_ICON = 3      // o ícone amarelo abre o jogo de empilhar blocos
 
+        // Câmera em primeira pessoa dos jogos de mesa: você olha para a mesa à sua frente, de cima para baixo.
+        const val FP_EYE_Y = 0.90f        // altura dos seus olhos acima do tampo (mesa de lado 1,0)
+        const val FP_EYE_Z = 1.35f        // distância dos olhos até o meio da mesa
+        const val FP_PITCH0 = 0.55f       // quanto você olha para baixo (radianos, ~31 graus)
+
         // Jogo de física (teste). A física em si (atrito, quique, peso) fica no começo da classe PhysTable.
         const val PHYS_HANDS = 2            // quantas mãos empurram os objetos
         const val PHYS_PLANE_Y = 0.07f      // altura (em cima do tampo) em que a mão "toca" a mesa
@@ -4108,13 +4172,14 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val DOT = ICON_COUNT + 9           // pinça na bolinha que fecha a janela
         const val POP = ICON_COUNT + 10          // pinça num item da lista do •••
         const val APP_TILE = ICON_COUNT + 11     // pinça num jogo da lista de Jogos
+        const val TABLE_BACK = ICON_COUNT + 12   // pinça no botão de voltar (jogos de mesa)
 
         // Jogo 3D de empilhar blocos (a mesa tem 1,0 de lado).
         const val GAME_BLOCKS = 5
         const val GAME_BH = 0.12f         // altura de cada bloco
         const val TABLE_HALF = 0.5f       // metade do lado da mesa
         const val TABLE_TH = 0.07f        // grossura do tampo da mesa
-        const val TABLE_LEG = 0.30f       // altura das pernas (do chão até o topo do tampo)
+        const val TABLE_LEG = 0.40f       // altura das pernas (do chão até o topo do tampo)
         val TABLE_PLANK = floatArrayOf(1.0f, 0.94f, 1.04f, 0.97f, 1.02f)   // tom de cada tábua do tampo
         const val GAME_ASPECT = 0.80f     // altura / largura da janela do jogo
         const val GAME_GRAVITY = 3.0f
