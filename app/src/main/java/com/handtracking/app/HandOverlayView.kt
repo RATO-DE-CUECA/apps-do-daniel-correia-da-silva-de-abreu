@@ -533,7 +533,12 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     private var depthGrabSize = 0f
     private var depthSmoothRatio = 1f
     private var depthShowUntil = 0L
-    private var dScale = 1f                       // 1 / depthZ: escala do menu na tela
+    private var dScale = 1f                       // 1 / effZ: escala do menu na tela
+    // Andar de verdade: metros andados para a frente (positivo) vindos da câmera; o menu chega mais perto.
+    @Volatile private var walkTarget = 0f
+    private var walkSmooth = 0f
+    private var walkShown = 0f
+    private var effZ = 1f                         // distância final do menu = depthZ - o quanto você andou
     private var pvX = 0f                          // centro da escala (centro da barra, preso à imagem)
     private var pvY = 0f
     private val pinchSX = FloatArray(MAX_HANDS)   // pinça na tela (sem a escala do menu)
@@ -549,7 +554,8 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
 
     /** Calcula a escala do menu e o centro dela (centro da barra, limitado à imagem). */
     private fun updateDepthPivot(iw: Float, ih: Float) {
-        dScale = 1f / depthZ
+        effZ = if (worldActive) (depthZ - walkSmooth).coerceIn(WALK_MIN_Z, WALK_MAX_Z) else depthZ
+        dScale = 1f / effZ
         pvX = barCX.coerceIn(0f, iw)
         pvY = barCY.coerceIn(0f, ih)
     }
@@ -660,6 +666,11 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
     private fun setAxes(rx: Float, ry: Float, rz: Float, ux: Float, uy: Float, uz: Float) {
         eRight[0] = rx; eRight[1] = ry; eRight[2] = rz
         eUp[0] = ux; eUp[1] = uy; eUp[2] = uz
+    }
+
+    /** Quanto você andou para a frente (metros, negativo = para trás). Vem do rastreador por câmera. */
+    fun setWalk(meters: Float) {
+        walkTarget = meters
     }
 
     /** Traz a barra de volta para a frente de você (e os menus voltam a acompanhar a barra). */
@@ -1202,6 +1213,19 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         } else {
             depthZ = depthTarget
             depthSettling = false
+        }
+        // Andar: o menu chega mais perto (ou se afasta) suavemente conforme você anda.
+        val walkGoal = if (worldActive) walkTarget else 0f
+        val wd = walkGoal - walkSmooth
+        if (abs(wd) > 0.002f) {
+            walkSmooth += wd * WALK_EASE
+            depthSettling = true
+        } else {
+            walkSmooth = walkGoal
+        }
+        if (abs(walkSmooth - walkShown) > 0.05f) {
+            walkShown = walkSmooth
+            depthShowUntil = SystemClock.uptimeMillis() + DEPTH_LABEL_MS
         }
         applyGeometry(iw, ih)
         updateDepthPivot(iw, ih)
@@ -3563,7 +3587,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             canvas.restore()
             if (SystemClock.uptimeMillis() < depthShowUntil) {
                 depthPaint.textSize = ih * scale * 0.06f
-                val label = "Distância: " + String.format("%.1f", depthZ).replace('.', ',') + " m"
+                val label = "Distância: " + String.format("%.1f", effZ).replace('.', ',') + " m"
                 canvas.drawText(label, offsetX + iw * scale / 2f, offsetY + ih * scale * 0.1f, depthPaint)
             }
         }
@@ -4060,6 +4084,9 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val DEPTH_HAND_SMOOTH = 0.3f // suaviza o tamanho da mão (tremida do hand tracking)
         const val DEPTH_EASE = 0.4f        // o menu anda suave até a nova distância
         const val DEPTH_PARALLAX = 0.02f   // efeito 3D no VR Box (fração da largura; 0 = desliga)
+        const val WALK_MIN_Z = 0.4f        // andando para a frente, o menu chega até aqui (~2,5x maior)
+        const val WALK_MAX_Z = 3.0f        // andando para trás, o menu vai até aqui (~0,33x)
+        const val WALK_EASE = 0.25f        // o menu acompanha suave o quanto você andou
         const val DEPTH_LABEL_MS = 900L    // quanto tempo o texto "Distância" fica na tela
 
         const val ICON_COUNT = 6     // menus: 0 a 2 têm ícone; 3 (Blocos), 4 (Tiro) e 5 (Física) abrem pela lista de Jogos
