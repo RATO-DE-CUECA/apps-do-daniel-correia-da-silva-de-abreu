@@ -54,6 +54,13 @@ class VisualOrientation {
     private val sortY = FloatArray(MAX_BLOCKS)
     private val weightX = FloatArray(MAX_BLOCKS)
     private val weightY = FloatArray(MAX_BLOCKS)
+    private val posU = FloatArray(MAX_BLOCKS)    // posição do bloco (pixels, a partir do centro da imagem)
+    private val posV = FloatArray(MAX_BLOCKS)
+    private val zoomOk = BooleanArray(MAX_BLOCKS)
+
+    // Andar para a frente/para trás: a cena "cresce" na imagem quando você anda para a frente.
+    // walkLog soma o quanto a imagem cresceu (em escala logarítmica); vira metros multiplicando por WALK_DEPTH_M.
+    private var walkLog = 0f
 
     // Último movimento medido (usado para "continuar girando" se um quadro não der para medir).
     private var lastSx = 0f
@@ -102,7 +109,17 @@ class VisualOrientation {
 
     /** Esquece o quadro anterior (use quando a câmera trocar ou a tela girar). */
     fun reset() {
-        synchronized(lock) { hasPrev = false }
+        synchronized(lock) { hasPrev = false; walkLog = 0f }
+    }
+
+    /** Quanto você andou para a frente (positivo) ou para trás (negativo), em metros, desde o último "Centralizar". */
+    fun walkMeters(): Float {
+        synchronized(lock) { return walkLog * WALK_DEPTH_M }
+    }
+
+    /** Zera a caminhada (botão "Centralizar"). */
+    fun resetWalk() {
+        synchronized(lock) { walkLog = 0f }
     }
 
     /** Última orientação (cópia) ou null se ainda não deu para calcular. */
@@ -285,6 +302,8 @@ class VisualOrientation {
                 val v = (2 * by + BLOCK) - gh / 2f
                 weightX[n] = 1f + u * u / (f0 * f0)
                 weightY[n] = 1f + v * v / (f0 * f0)
+                posU[n] = u
+                posV[n] = v
                 n++
             }
         }
@@ -298,6 +317,9 @@ class VisualOrientation {
         java.util.Arrays.sort(sortY, 0, n)
         val medX = if (n % 2 == 1) sortX[n / 2] else (sortX[n / 2 - 1] + sortX[n / 2]) / 2f
         val medY = if (n % 2 == 1) sortY[n / 2] else (sortY[n / 2 - 1] + sortY[n / 2]) / 2f
+
+        // Andar: a cena cresce (ou encolhe) na imagem. Isso é independente do giro da cabeça.
+        estimateZoom(n, medX, medY)
 
         // Média só dos blocos que concordam com a mediana.
         var inliers = 0
@@ -331,6 +353,56 @@ class VisualOrientation {
 
         rotateByShift(lastSx, lastSy)
         return true
+    }
+
+    /**
+     * Mede o quanto a imagem CRESCEU entre dois quadros (você andou para a frente) ou ENCOLHEU (para trás).
+     * Cada bloco desliza para fora do centro (ou para dentro) em proporção à distância dele ao centro:
+     * deslize = escala * posição. Acha a escala por mínimos quadrados e soma em walkLog.
+     */
+    private fun estimateZoom(n: Int, medX: Float, medY: Float) {
+        if (!WALK_ENABLED) return
+        // Giro rápido da cabeça: a imagem fica borrada e a medida engana. Ignora esse quadro.
+        if (abs(medX) > ZOOM_MAX_SLIDE || abs(medY) > ZOOM_MAX_SLIDE) return
+
+        var s = 0f
+        for (pass in 0..1) {
+            var cnt = 0
+            var mu = 0f; var mv = 0f; var mx = 0f; var my = 0f
+            for (i in 0 until n) {
+                if (pass == 1 && !zoomOk[i]) continue
+                cnt++
+                mu += posU[i]; mv += posV[i]; mx += shiftX[i]; my += shiftY[i]
+            }
+            if (cnt < MIN_BLOCKS) return
+            mu /= cnt; mv /= cnt; mx /= cnt; my /= cnt
+            var num = 0f
+            var den = 0f
+            for (i in 0 until n) {
+                if (pass == 1 && !zoomOk[i]) continue
+                val du = posU[i] - mu
+                val dv = posV[i] - mv
+                num += (shiftX[i] - mx) * du + (shiftY[i] - my) * dv
+                den += du * du + dv * dv
+            }
+            if (den < ZOOM_MIN_SPREAD) return   // blocos muito juntos: não dá para medir
+            s = num / den
+            if (pass == 0) {
+                // Tira os blocos que não combinam (algo se mexendo na cena).
+                for (i in 0 until n) {
+                    val du = posU[i] - mu
+                    val dv = posV[i] - mv
+                    val rx = shiftX[i] - mx - s * du
+                    val ry = shiftY[i] - my - s * dv
+                    zoomOk[i] = abs(rx) + abs(ry) < ZOOM_OUTLIER
+                }
+            }
+        }
+
+        s = s.coerceIn(-ZOOM_MAX_STEP, ZOOM_MAX_STEP)
+        // Ruído da câmera: variações minúsculas viram zero (senão o menu "anda sozinho").
+        val d = if (abs(s) < ZOOM_DEAD) 0f else s - ZOOM_DEAD * (if (s > 0f) 1f else -1f)
+        if (d != 0f) walkLog = (walkLog + d).coerceIn(-WALK_MAX_LOG, WALK_MAX_LOG)
     }
 
     /** Gira a câmera de acordo com o deslizamento da imagem (em pixels do nível 0). */
@@ -510,6 +582,16 @@ class VisualOrientation {
         const val INLIER = 1.2f             // blocos que concordam (em pixels)
         const val DEAD_ZONE = 0.04f         // ruído (em pixels) que vira zero
         const val HAND_PAD = 0.10f          // folga em volta da mão
+
+        // Andar de verdade (a câmera mede o quanto a cena cresce/encolhe)
+        const val WALK_ENABLED = true       // false desliga o "andar" (o resto do app não muda)
+        const val WALK_DEPTH_M = 2.0f       // distância típica da cena (m): converte "cresceu X%" em metros
+        const val WALK_MAX_LOG = 0.9f       // limite do quanto dá para andar (~ +-1,8 m)
+        const val ZOOM_DEAD = 0.0015f       // crescimento por quadro abaixo disso = ruído
+        const val ZOOM_MAX_STEP = 0.05f     // crescimento máximo aceito por quadro
+        const val ZOOM_MAX_SLIDE = 6f       // se a imagem desliza mais que isso (pixels), é giro rápido: ignora
+        const val ZOOM_OUTLIER = 1.5f       // blocos que fogem disso (pixels) são descartados
+        const val ZOOM_MIN_SPREAD = 2000f   // espalhamento mínimo dos blocos para medir
         const val ACCEL_SMOOTH = 0.5f       // suavização do acelerômetro
         const val GRAVITY_GAIN = 0.08f      // força da correção pela gravidade (por quadro)
     }
