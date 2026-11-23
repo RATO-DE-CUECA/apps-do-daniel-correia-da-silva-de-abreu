@@ -224,7 +224,7 @@ class MainActivity : AppCompatActivity() {
 
         centerButton = findViewById(R.id.centerButton)
         centerButton.visibility = if (hasRotationSensor) View.VISIBLE else View.GONE
-        centerButton.setOnClickListener { overlay.recenter() }
+        centerButton.setOnClickListener { overlay.recenter(); visual.resetWalk() }
     }
 
     private fun setupWebView() {
@@ -486,6 +486,7 @@ class MainActivity : AppCompatActivity() {
             val r = visual.onFrame(pixelBuffer, outW, outH, overlay.handBoxes())
             if (r != null) {
                 overlay.setGyro(r)
+                overlay.setWalk(visual.walkMeters())
                 frameRotation = r
             }
         }
