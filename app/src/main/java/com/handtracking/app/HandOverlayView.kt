@@ -239,6 +239,26 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             postInvalidate()
         }
 
+    // ---- Tamanho dos menus: pinça no cantinho de baixo à direita e arrastar aumenta ou diminui ----
+    // 1 = tamanho padrão. Cada menu lembra o próprio tamanho (fica salvo no aparelho).
+    private val panelScale = FloatArray(ICON_COUNT) { prefs.getFloat("panel_scale_$it", 1f).coerceIn(PANEL_SCALE_MIN, PANEL_SCALE_MAX) }
+    private var panelBaseW = 0f                     // tamanho padrão do menu aberto (antes de aumentar/diminuir)
+    private var panelBaseH = 0f
+    private var cornerOn = false                    // o cantinho de redimensionar está na tela
+    private var cornerCX = 0f                       // centro do cantinho (para encostar e pegar)
+    private var cornerCY = 0f
+    private var cornerR = 0f
+    private var cornerTouch = false                 // dedo indicador encostando no cantinho
+    private var resizeL0 = 0f                       // canto de cima à esquerda do menu (fica parado enquanto você puxa)
+    private var resizeT0 = 0f
+    private var resizeOffX = 0f                     // diferença entre o canto de baixo à direita e a pinça, ao pegar
+    private var resizeOffY = 0f
+    private val cornerPaint = Paint().apply {
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
+
     private var settingsTab = 0                     // aba aberta nas configurações: 0 = Mão, 1 = Menu
     private val tabL = FloatArray(2)                // abas (esquerda de cada uma)
     private var tabT = 0f
@@ -945,8 +965,22 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 panelW = availW
             }
         }
+        // Tamanho que você escolheu puxando o cantinho (só nos menus em janela; os jogos de mesa ocupam a tela toda).
+        panelBaseW = panelW
+        panelBaseH = panelH
+        if (openMenu != NONE && !isTableOpen()) {
+            var ps = panelScale[openMenu]
+            if (ps > 1f && !worldActive) {
+                // Sem o 3D, o menu maior continua cabendo na tela.
+                val fit = min((iw - margin * 2f) / panelW, (ih - margin * 2f - gap * 3.5f) / panelH)
+                ps = max(1f, min(ps, fit))
+            }
+            panelW *= ps
+            panelH *= ps
+        }
         panelCorner = gap * 1.6f
         pHandleW = panelW * 0.5f
+        cornerOn = false
         val m = openMenu
         if (m != NONE) {
             val left: Float
@@ -1011,6 +1045,15 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 resetR = backR
                 resetCX = iw - u * 0.075f
                 resetCY = u * 0.075f
+            }
+            // Cantinho de baixo à direita (aumentar/diminuir): um arco em volta do canto arredondado da janela.
+            if (!isTableOpen()) {
+                cornerOn = true
+                val crad = gap * 2f
+                val cgr = crad + gap * 1.1f
+                cornerCX = panelLeft + panelW - crad + cgr * 0.7071f
+                cornerCY = panelTop + panelH - crad + cgr * 0.7071f
+                cornerR = gap * 1.7f
             }
             // Abas e cartões de escolha do menu de configurações.
             val pad = panelW * 0.05f
@@ -1241,6 +1284,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         popTouch[0] = false
         popTouch[1] = false
         dotTouch = false
+        cornerTouch = false
         resetTouch = false
         backTouch = false
         var handleTouch = false
@@ -1289,6 +1333,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     handleTouch = true
                 }
                 if (tableUi && hypot(fx - backCX, fy - backCY) <= backR * 1.5f) backTouch = true
+                if (!tableUi && cornerOn && hypot(fx - cornerCX, fy - cornerCY) <= cornerR * 1.25f) cornerTouch = true
                 if (menuLayout == LAYOUT_GRID && !tableUi) {
                     for (w in 0..1) {
                         if (w == 1 && openMenu == NONE) continue
@@ -1357,6 +1402,7 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
             gameHeld = -1
         }
         if (grabbed == TABLE_BACK && !isTableOpen()) grabbed = NONE
+        if (grabbed == PANEL_CORNER && (openMenu == NONE || isTableOpen())) grabbed = NONE
         if (grabbed == APP_TILE && (openMenu != GAMES_ICON || tileHeld < 0)) {
             grabbed = NONE
             tileHeld = -1
@@ -1401,6 +1447,10 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 ) {
                     val d = hypot(px - pHandleCX, py - pHandleCY) + iconS
                     if (d < bestDist) { best = PANEL_HANDLE; bestDist = d; bestIdx = p }
+                }
+                if (cornerOn && hypot(px - cornerCX, py - cornerCY) <= cornerR * 1.25f) {
+                    val d = hypot(px - cornerCX, py - cornerCY)
+                    if (d < bestDist) { best = PANEL_CORNER; bestDist = d; bestIdx = p }
                 }
                 if (menuLayout == LAYOUT_GRID) {
                     for (w in 0..1) {
@@ -1529,6 +1579,14 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                         depthGrabSize = pinchSize[bestIdx]
                         depthSmoothRatio = 1f
                     }
+                    PANEL_CORNER -> {
+                        grabOffsetX = 0f
+                        grabOffsetY = 0f
+                        resizeL0 = panelLeft
+                        resizeT0 = panelTop
+                        resizeOffX = panelLeft + panelW - pinchX[bestIdx]
+                        resizeOffY = panelTop + panelH - pinchY[bestIdx]
+                    }
                     GAME_BLOCK -> {
                         val b = gameHeld
                         grabOffsetX = 0f
@@ -1633,6 +1691,9 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                 if (grabbed == PANEL_CONTENT) {
                     emitWebTouch(MotionEvent.ACTION_UP, lastWebPX, lastWebPY)
                 }
+                if (grabbed == PANEL_CORNER && openMenu != NONE) {
+                    prefs.edit().putFloat("panel_scale_$openMenu", panelScale[openMenu]).apply()   // lembra o tamanho
+                }
                 grabbed = NONE
                 applyGeometry(iw, ih)
             } else {
@@ -1651,6 +1712,10 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                     PANEL_CONTENT -> {
                         expectedX = lastWebPX
                         expectedY = lastWebPY
+                    }
+                    PANEL_CORNER -> {
+                        expectedX = panelLeft + panelW - resizeOffX
+                        expectedY = panelTop + panelH - resizeOffY
                     }
                     GAME_BLOCK, GAME_ORBIT -> {
                         expectedX = lastGameX
@@ -1695,6 +1760,33 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
                             } else {
                                 panelNX[m] = (cx / iw).coerceIn(0f, 1f)
                                 panelNY[m] = (cy / ih).coerceIn(0f, 1f)
+                            }
+                        }
+                    }
+                    PANEL_CORNER -> {
+                        val m = openMenu
+                        if (m != NONE && panelBaseW > 1f && panelBaseH > 1f) {
+                            // O canto de baixo à direita acompanha a pinça; o de cima à esquerda fica parado.
+                            // O tamanho muda sem deformar (mesma proporção): usa a diagonal.
+                            val cxr = pinchX[idx] + resizeOffX
+                            val cyr = pinchY[idx] + resizeOffY
+                            var s = ((cxr - resizeL0) * panelBaseW + (cyr - resizeT0) * panelBaseH) /
+                                (panelBaseW * panelBaseW + panelBaseH * panelBaseH)
+                            val mg = min(iw, ih) * 0.03f
+                            val maxS = if (worldActive) PANEL_SCALE_MAX else min(
+                                PANEL_SCALE_MAX,
+                                max(1f, min((iw - mg - resizeL0) / panelBaseW, (ih - mg - gap * 2.5f - resizeT0) / panelBaseH))
+                            )
+                            s = s.coerceIn(PANEL_SCALE_MIN, maxS)
+                            panelScale[m] = s
+                            val ncx = resizeL0 + panelBaseW * s / 2f
+                            val ncy = resizeT0 + panelBaseH * s / 2f
+                            panelMoved[m] = true
+                            if (worldActive) {
+                                unproject(ncx, ncy, iw, ih, panelDir[m])
+                            } else {
+                                panelNX[m] = (ncx / iw).coerceIn(0f, 1f)
+                                panelNY[m] = (ncy / ih).coerceIn(0f, 1f)
                             }
                         }
                     }
@@ -3893,9 +3985,33 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         }
         // Barrinha branca embaixo do menu: serve para mover só este menu.
         drawHandle(canvas, pHandleCX, pHandleCY, pHandleW, pHandleState)
+        drawCornerGrip(canvas)
 
         if (tilted) canvas.restore()
         if (animated) canvas.restore()
+    }
+
+    /** Cantinho de baixo à direita do menu: um arco em volta do canto. Pinça nele e arraste para aumentar ou diminuir. */
+    private fun drawCornerGrip(canvas: Canvas) {
+        if (!cornerOn) return
+        val held = grabbed == PANEL_CORNER
+        val crad = gap * 2f
+        val cgr = crad + gap * 1.1f
+        val ccx = panelLeft + panelW - crad
+        val ccy = panelTop + panelH - crad
+        rect.set(ccx - cgr, ccy - cgr, ccx + cgr, ccy + cgr)
+        val w = if (held) gap * 0.8f else if (cornerTouch) gap * 0.62f else gap * 0.46f
+        cornerPaint.strokeWidth = w + gap * 0.3f
+        cornerPaint.color = Color.argb(90, 0, 0, 0)            // sombra fininha: o arco aparece também em fundo claro
+        canvas.drawArc(rect, 12f, 66f, false, cornerPaint)
+        cornerPaint.strokeWidth = w
+        cornerPaint.color = if (held) Color.YELLOW else Color.argb(if (cornerTouch) 255 else 200, 255, 255, 255)
+        canvas.drawArc(rect, 12f, 66f, false, cornerPaint)
+        if (held && panelBaseW > 1f) {
+            thinPaint.textAlign = Paint.Align.CENTER
+            thinPaint.textSize = iconS * 0.26f
+            canvas.drawText((panelW / panelBaseW * 100f + 0.5f).toInt().toString() + "%", cornerCX - gap * 2.2f, cornerCY + gap * 2.6f, thinPaint)
+        }
     }
 
     // ---------- desenhos dos ícones (tudo feito com formas simples, em branco) ----------
@@ -4200,6 +4316,9 @@ class HandOverlayView(context: Context, attrs: AttributeSet?) : View(context, at
         const val POP = ICON_COUNT + 10          // pinça num item da lista do •••
         const val APP_TILE = ICON_COUNT + 11     // pinça num jogo da lista de Jogos
         const val TABLE_BACK = ICON_COUNT + 12   // pinça no botão de voltar (jogos de mesa)
+        const val PANEL_CORNER = ICON_COUNT + 13 // pinça no cantinho do menu (aumentar/diminuir)
+        const val PANEL_SCALE_MIN = 0.5f         // menor tamanho do menu (metade do padrão)
+        const val PANEL_SCALE_MAX = 2.2f         // maior tamanho do menu
 
         // Jogo 3D de empilhar blocos (a mesa tem 1,0 de lado).
         const val GAME_BLOCKS = 5
