@@ -1,0 +1,713 @@
+package com.handtracking.app
+
+import android.Manifest
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Matrix
+import android.graphics.Outline
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.hardware.display.DisplayManager
+import android.os.SystemClock
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.view.MotionEvent
+import android.view.Surface
+import android.view.View
+import android.view.ViewOutlineProvider
+import android.view.WindowManager
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Button
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.AspectRatio
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.content.ContextCompat
+import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.core.Delegate
+import com.google.mediapipe.tasks.vision.core.RunningMode
+import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
+import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
+import java.net.URLEncoder
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var previewView: PreviewView
+    private lateinit var overlay: HandOverlayView
+    private lateinit var modeButton: Button
+    private lateinit var flipButton: Button
+    private lateinit var webView: WebView
+    private lateinit var centerButton: Button
+
+    // Giroscópio (modo 3D): a barra e os menus ficam parados no espaço.
+    private var sensorManager: SensorManager? = null
+    private var rotationSensor: Sensor? = null
+    private var hasRotationSensor = false
+
+    // Sem giroscópio: usa a câmera (quanto a imagem deslizou) + o acelerômetro (onde fica o chão).
+    private val visual = VisualOrientation()
+    private var useVisual = false
+    private var accelSensor: Sensor? = null
+    private var pixelBuffer = IntArray(0)
+    private val rotationMatrix = FloatArray(9)
+    private val rotationValues = FloatArray(4)
+    private val sensorListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            var values = event.values
+            if (values.size > 4) {
+                System.arraycopy(values, 0, rotationValues, 0, 4)
+                values = rotationValues
+            }
+            SensorManager.getRotationMatrixFromVector(rotationMatrix, values)
+            overlay.setGyro(rotationMatrix.clone())
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
+
+    private val accelListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            visual.onAccel(event.values[0], event.values[1], event.values[2])
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
+
+    // YouTube dentro do menu vermelho (só no modo normal).
+    private var webShown = false
+    private var webLoaded = false
+    private var webX = 0f
+    private var webY = 0f
+    private var webW = 0f
+    private var webH = 0f
+    private var webR = 0f
+    private var webOutlineRadius = 0f
+    private var webDownTime = 0L
+
+    // YouTube no modo VR Box (tela virtual copiada para os dois olhos).
+    private var webTexture: WebTexture? = null
+    private var vrWebWanted = false
+    private lateinit var cameraExecutor: ExecutorService
+
+    private var handLandmarker: HandLandmarker? = null
+
+    // true = modo VR Box (tela dividida, câmera traseira, tela deitada).
+    // Para o app abrir direto no modo normal, troque este valor padrão para false.
+    @Volatile private var vrMode = true
+    private var lensFacing = CameraSelector.LENS_FACING_BACK
+
+    @Volatile private var analysis: ImageAnalysis? = null
+
+    // Bitmaps e matriz reaproveitados a cada frame (evita alocar memória 30x por segundo).
+    // São 2 bitmaps de saída que se alternam, para a tela não desenhar um frame
+    // enquanto ele está sendo reescrito.
+    private var frameBitmap: Bitmap? = null
+    private val frameBuffers = arrayOfNulls<Bitmap>(2)
+    private var frameBufferIndex = 0
+    private val transform = Matrix()
+
+    private val permissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) startCamera() else {
+                Toast.makeText(this, R.string.permission_denied, Toast.LENGTH_LONG).show()
+            }
+            askMicPermissionAtStart()
+        }
+
+    // Pesquisa por voz no YouTube (botão de microfone ao lado da barrinha do menu).
+    private var recognizer: SpeechRecognizer? = null
+    private var voiceListening = false
+    private var voicePending = false      // true = o pedido de permissão veio do toque no microfone
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private val clearVoiceRunnable = Runnable { overlay.setVoiceState(0, "") }
+
+    private val micPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            val wasSearch = voicePending
+            voicePending = false
+            if (granted) {
+                if (wasSearch) beginListening()
+            } else if (wasSearch) {
+                showVoiceMessage("Sem permissão do microfone. Ative nos Ajustes do app", 3, 4000)
+            }
+        }
+
+    // Se a tela girar de um lado deitado para o outro, avisa a câmera.
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+        override fun onDisplayChanged(displayId: Int) {
+            analysis?.targetRotation = currentRotation()
+            overlay.setDisplayRotation(currentRotation())
+            visual.setDisplayRotation(currentRotation())
+            visual.reset()
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        vrMode = savedInstanceState?.getBoolean(KEY_VR_MODE, true) ?: true
+        lensFacing = savedInstanceState?.getInt(KEY_LENS, CameraSelector.LENS_FACING_BACK)
+            ?: CameraSelector.LENS_FACING_BACK
+        requestedOrientation = orientationForMode()
+
+        setContentView(R.layout.activity_main)
+        // Mantém a tela acesa (dentro do VR Box você não toca na tela).
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        previewView = findViewById(R.id.previewView)
+        previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
+        overlay = findViewById(R.id.overlay)
+        modeButton = findViewById(R.id.modeButton)
+        setupWebView()
+        setupSensors()
+        cameraExecutor = Executors.newSingleThreadExecutor()
+
+        flipButton = findViewById(R.id.flipButton)
+        flipButton.setOnClickListener {
+            lensFacing = if (lensFacing == CameraSelector.LENS_FACING_FRONT)
+                CameraSelector.LENS_FACING_BACK else CameraSelector.LENS_FACING_FRONT
+            overlay.clear()
+            startCamera()
+        }
+
+        // Botão do cantinho: alterna entre VR Box (tela dividida) e modo normal.
+        modeButton.setOnClickListener {
+            vrMode = !vrMode
+            // VR Box usa a câmera traseira; o modo normal volta para a frontal.
+            lensFacing = if (vrMode) CameraSelector.LENS_FACING_BACK
+            else CameraSelector.LENS_FACING_FRONT
+            requestedOrientation = orientationForMode()
+            applyModeUi()
+            startCamera()
+        }
+
+        applyModeUi()
+
+        (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
+            .registerDisplayListener(displayListener, null)
+
+        setupHandLandmarker()
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            startCamera()
+            askMicPermissionAtStart()
+        } else permissionLauncher.launch(Manifest.permission.CAMERA)
+    }
+
+    /** Pede a permissão do microfone logo no começo (assim você não precisa tirar o celular do VR Box depois). */
+    private fun askMicPermissionAtStart() {
+        if (micAskedAtStart) return   // só uma vez por abertura do app (a tela recria ao trocar de modo)
+        micAskedAtStart = true
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            voicePending = false
+            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(KEY_VR_MODE, vrMode)
+        outState.putInt(KEY_LENS, lensFacing)
+    }
+
+    private fun setupSensors() {
+        val sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        sensorManager = sm
+        val hasGyro = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE) != null
+        if (hasGyro) {
+            // Com giroscópio: usa o sensor de rotação do Android (o melhor jeito).
+            rotationSensor = sm.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
+                ?: sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+        }
+        if (rotationSensor == null) {
+            // Sem giroscópio: câmera (quanto a imagem deslizou) + acelerômetro (onde fica o chão).
+            accelSensor = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+            useVisual = accelSensor != null
+        }
+        hasRotationSensor = rotationSensor != null || useVisual
+        // Aviso rápido para saber como o 3D está funcionando neste celular.
+        val how = when {
+            rotationSensor != null -> "giroscópio"
+            useVisual -> "câmera + acelerômetro (sem giroscópio)"
+            else -> "indisponível neste celular"
+        }
+        Toast.makeText(this, "3D: $how", Toast.LENGTH_LONG).show()
+        visual.setDisplayRotation(currentRotation())
+        overlay.setDisplayRotation(currentRotation())
+
+        centerButton = findViewById(R.id.centerButton)
+        centerButton.visibility = if (hasRotationSensor) View.VISIBLE else View.GONE
+        centerButton.setOnClickListener { overlay.recenter(); visual.resetWalk() }
+    }
+
+    private fun setupWebView() {
+        webView = findViewById(R.id.youtubeView)
+        webView.settings.javaScriptEnabled = true
+        webView.settings.domStorageEnabled = true
+        webView.settings.mediaPlaybackRequiresUserGesture = false
+        webView.webViewClient = WebViewClient()
+        webView.webChromeClient = WebChromeClient()
+        webView.setBackgroundColor(Color.BLACK)
+        // Cantos arredondados, igual ao menu.
+        webView.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(view: View, outline: Outline) {
+                outline.setRoundRect(0, 0, view.width, view.height, webOutlineRadius)
+            }
+        }
+        webView.clipToOutline = true
+
+        // O overlay diz onde o YouTube deve ficar e manda a pinça como toque.
+        overlay.onWebPanel = { visible, x, y, w, h, r -> updateWebPanel(visible, x, y, w, h, r) }
+        overlay.onWebTouch = { action, x, y -> sendWebTouch(action, x, y) }
+        overlay.onVrWebWanted = { wanted -> updateVrWeb(wanted) }
+        overlay.onVrWebTouch = { action, x, y -> webTexture?.touch(action, x, y) }
+        overlay.onVoiceSearch = { runOnUiThread { toggleVoiceSearch() } }
+    }
+
+    // ---------------- Pesquisa por voz no YouTube ----------------
+
+    /** Pinça no microfone: começa a ouvir; se já estiver ouvindo, cancela. */
+    private fun toggleVoiceSearch() {
+        if (voiceListening) {
+            cancelVoice()
+            return
+        }
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            showVoiceMessage("Este celular não tem reconhecimento de voz", 3, 4000)
+            return
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            voicePending = true
+            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
+        beginListening()
+    }
+
+    private fun beginListening() {
+        if (voiceListening) return
+        val sr = try {
+            SpeechRecognizer.createSpeechRecognizer(this)
+        } catch (e: Exception) {
+            null
+        }
+        if (sr == null) {
+            showVoiceMessage("Não consegui ligar o reconhecimento de voz", 3, 4000)
+            return
+        }
+        recognizer = sr
+        voiceListening = true
+        uiHandler.removeCallbacks(clearVoiceRunnable)
+        pauseYoutube()   // o som do vídeo atrapalharia o microfone
+
+        sr.setRecognitionListener(object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) {
+                if (recognizer === sr) overlay.setVoiceState(1, "Ouvindo… fale o que quer buscar")
+            }
+
+            override fun onBeginningOfSpeech() {}
+            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onBufferReceived(buffer: ByteArray?) {}
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+
+            override fun onEndOfSpeech() {
+                if (recognizer === sr) overlay.setVoiceState(2, "Entendendo…")
+            }
+
+            override fun onPartialResults(partialResults: Bundle?) {
+                if (recognizer !== sr) return
+                val text = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    ?.firstOrNull()
+                if (!text.isNullOrBlank()) overlay.setVoiceState(1, text)
+            }
+
+            override fun onResults(results: Bundle?) {
+                if (recognizer !== sr) return
+                val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    ?.firstOrNull()?.trim()
+                releaseRecognizer()
+                if (text.isNullOrEmpty()) {
+                    showVoiceMessage("Não entendi. Toque no microfone e tente de novo", 3, 3500)
+                } else {
+                    searchYoutube(text)
+                }
+            }
+
+            override fun onError(error: Int) {
+                if (recognizer !== sr) return
+                releaseRecognizer()
+                val msg = when (error) {
+                    SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT ->
+                        "Não ouvi nada. Toque no microfone e tente de novo"
+                    SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT ->
+                        "Sem internet para entender a voz"
+                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Sem permissão do microfone"
+                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "O reconhecimento de voz está ocupado"
+                    else -> "Não consegui entender a voz (erro $error)"
+                }
+                showVoiceMessage(msg, 3, 3500)
+            }
+        })
+
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_WEB_SEARCH)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pt-BR")
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+        }
+        overlay.setVoiceState(1, "Ouvindo… fale o que quer buscar")
+        try {
+            sr.startListening(intent)
+        } catch (e: Exception) {
+            releaseRecognizer()
+            showVoiceMessage("Não consegui começar a ouvir", 3, 3500)
+        }
+    }
+
+    /** Abre a busca do YouTube com o que você falou (no YouTube de verdade ou no virtual do VR Box). */
+    private fun searchYoutube(query: String) {
+        val url = "https://m.youtube.com/results?search_query=" + URLEncoder.encode(query, "UTF-8")
+        showVoiceMessage("Buscando: $query", 2, 2500)
+        if (vrMode) {
+            webTexture?.loadUrl(url)
+        } else {
+            webLoaded = true
+            webView.loadUrl(url)
+        }
+    }
+
+    private fun pauseYoutube() {
+        webView.evaluateJavascript("document.querySelectorAll('video').forEach(function(v){v.pause();})", null)
+        webTexture?.pauseVideo()
+    }
+
+    /** Para de ouvir e some com o aviso. */
+    private fun cancelVoice() {
+        releaseRecognizer()
+        uiHandler.removeCallbacks(clearVoiceRunnable)
+        overlay.setVoiceState(0, "")
+    }
+
+    private fun releaseRecognizer() {
+        val sr = recognizer ?: return
+        recognizer = null
+        voiceListening = false
+        uiHandler.post {
+            try { sr.cancel() } catch (e: Exception) { }
+            try { sr.destroy() } catch (e: Exception) { }
+        }
+    }
+
+    /** Mostra um aviso na etiqueta do YouTube e some com ele depois de um tempo. */
+    private fun showVoiceMessage(text: String, state: Int, ms: Long) {
+        overlay.setVoiceState(state, text)
+        uiHandler.removeCallbacks(clearVoiceRunnable)
+        uiHandler.postDelayed(clearVoiceRunnable, ms)
+    }
+
+    /** O YouTube fechou (nos dois modos)? Então para de ouvir. */
+    private fun cancelVoiceIfYoutubeClosed() {
+        if (!webShown && !vrWebWanted && (voiceListening || recognizer != null)) cancelVoice()
+    }
+
+    private fun updateWebPanel(visible: Boolean, x: Float, y: Float, w: Float, h: Float, radius: Float) {
+        if (!visible) {
+            if (webShown) {
+                webShown = false
+                webView.post {
+                    // Pausa o vídeo ao fechar o menu.
+                    webView.evaluateJavascript(
+                        "document.querySelectorAll('video').forEach(function(v){v.pause();})", null
+                    )
+                    webView.visibility = View.GONE
+                }
+            }
+            cancelVoiceIfYoutubeClosed()
+            return
+        }
+        if (webShown && x == webX && y == webY && w == webW && h == webH && radius == webR) return
+        webShown = true
+        webX = x; webY = y; webW = w; webH = h; webR = radius
+        webView.post {
+            val lp = webView.layoutParams
+            if (lp.width != w.toInt() || lp.height != h.toInt()) {
+                lp.width = w.toInt()
+                lp.height = h.toInt()
+                webView.layoutParams = lp
+            }
+            webView.translationX = x
+            webView.translationY = y
+            if (radius != webOutlineRadius) {
+                webOutlineRadius = radius
+                webView.invalidateOutline()
+            }
+            if (webView.visibility != View.VISIBLE) webView.visibility = View.VISIBLE
+            if (!webLoaded) {
+                webLoaded = true
+                webView.loadUrl("https://m.youtube.com")
+            }
+        }
+    }
+
+    /** Liga ou desliga o YouTube do modo VR Box (a tela virtual que vai para os dois olhos). */
+    private fun updateVrWeb(wanted: Boolean) {
+        if (wanted == vrWebWanted) return
+        vrWebWanted = wanted
+        if (wanted) {
+            val wt = webTexture ?: WebTexture(this).also { webTexture = it }
+            wt.onFrame = { overlay.setWebFrame(wt.latest) }
+            if (!wt.start()) {
+                Toast.makeText(this, "YouTube no VR Box não funcionou neste celular", Toast.LENGTH_LONG).show()
+            } else {
+                wt.setActive(true)
+            }
+        } else {
+            webTexture?.setActive(false)
+            cancelVoiceIfYoutubeClosed()
+        }
+    }
+
+    /** Transforma a pinça em um toque de dedo no YouTube. */
+    private fun sendWebTouch(action: Int, x: Float, y: Float) {
+        val now = SystemClock.uptimeMillis()
+        if (action == MotionEvent.ACTION_DOWN) webDownTime = now
+        val event = MotionEvent.obtain(webDownTime, now, action, x, y, 0)
+        webView.dispatchTouchEvent(event)
+        event.recycle()
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (webShown && webView.canGoBack()) webView.goBack() else super.onBackPressed()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        webView.onPause()
+        webTexture?.setActive(false)
+        cancelVoice()
+        sensorManager?.unregisterListener(sensorListener)
+        sensorManager?.unregisterListener(accelListener)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        webView.onResume()
+        webTexture?.setActive(vrWebWanted)
+        val sensor = rotationSensor
+        if (sensor != null) {
+            sensorManager?.registerListener(sensorListener, sensor, SensorManager.SENSOR_DELAY_GAME)
+        }
+        val accel = accelSensor
+        if (useVisual && accel != null) {
+            sensorManager?.registerListener(accelListener, accel, SensorManager.SENSOR_DELAY_GAME)
+        }
+        visual.reset()
+    }
+
+    private fun orientationForMode(): Int =
+        if (vrMode) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        else ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+
+    private fun applyModeUi() {
+        // No VR Box a imagem da câmera é desenhada pelo overlay (uma vez para cada olho),
+        // então o PreviewView normal fica escondido.
+        previewView.visibility = if (vrMode) View.GONE else View.VISIBLE
+        overlay.vrMode = vrMode
+        // No VR Box a câmera é sempre a traseira, então o botão de virar câmera some.
+        flipButton.visibility = if (vrMode) View.GONE else View.VISIBLE
+        modeButton.text = if (vrMode) "Modo normal" else "Modo VR Box"
+        overlay.clear()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun currentRotation(): Int = windowManager.defaultDisplay?.rotation ?: Surface.ROTATION_0
+
+    private fun buildLandmarker(delegate: Delegate): HandLandmarker {
+        val options = HandLandmarker.HandLandmarkerOptions.builder()
+            .setBaseOptions(
+                BaseOptions.builder()
+                    .setModelAssetPath("hand_landmarker.task")
+                    .setDelegate(delegate)
+                    .build()
+            )
+            .setRunningMode(RunningMode.LIVE_STREAM)
+            .setNumHands(2)
+            .setMinHandDetectionConfidence(0.45f)
+            .setMinHandPresenceConfidence(0.45f)
+            .setMinTrackingConfidence(0.45f)
+            .setResultListener { result: HandLandmarkerResult, input ->
+                overlay.setResults(result, input.width, input.height)
+            }
+            .setErrorListener { error ->
+                runOnUiThread { Toast.makeText(this, error.message, Toast.LENGTH_SHORT).show() }
+            }
+            .build()
+        return HandLandmarker.createFromOptions(this, options)
+    }
+
+    private fun setupHandLandmarker() {
+        // Tenta usar a GPU (bem mais rápido). Se o celular não suportar, cai para a CPU.
+        handLandmarker = try {
+            buildLandmarker(Delegate.GPU)
+        } catch (e: Exception) {
+            try {
+                buildLandmarker(Delegate.CPU)
+            } catch (e2: Exception) {
+                Toast.makeText(this, R.string.model_error, Toast.LENGTH_LONG).show()
+                null
+            }
+        }
+    }
+
+    private fun startCamera() {
+        // Modo 3D (menu parado no espaço) só funciona com a câmera traseira.
+        overlay.worldMode = hasRotationSensor && lensFacing == CameraSelector.LENS_FACING_BACK
+        visual.reset()
+
+        val providerFuture = ProcessCameraProvider.getInstance(this)
+        providerFuture.addListener({
+            // A tela pode ter sido recriada (giro de orientação) enquanto a câmera preparava.
+            if (isDestroyed || isFinishing) return@addListener
+
+            val provider = providerFuture.get()
+
+            val analysisCase = ImageAnalysis.Builder()
+                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                .setTargetRotation(currentRotation())
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                .build()
+                .also { it.setAnalyzer(cameraExecutor) { image -> detect(image) } }
+            analysis = analysisCase
+
+            val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
+            try {
+                provider.unbindAll()
+                if (vrMode) {
+                    // VR Box: só a análise; a imagem é desenhada pelo overlay nos dois olhos.
+                    provider.bindToLifecycle(this, selector, analysisCase)
+                } else {
+                    val preview = Preview.Builder()
+                        .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                        .build()
+                        .also { it.setSurfaceProvider(previewView.surfaceProvider) }
+                    provider.bindToLifecycle(this, selector, preview, analysisCase)
+                }
+            } catch (e: Exception) {
+                Toast.makeText(this, e.message, Toast.LENGTH_LONG).show()
+            }
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun detect(imageProxy: ImageProxy) {
+        val landmarker = handLandmarker
+        if (landmarker == null) {
+            imageProxy.close()
+            return
+        }
+
+        val w = imageProxy.width
+        val h = imageProxy.height
+        val rotation = imageProxy.imageInfo.rotationDegrees
+
+        // Reaproveita o bitmap do frame se o tamanho não mudou.
+        var frame = frameBitmap
+        if (frame == null || frame.width != w || frame.height != h) {
+            frame = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            frameBitmap = frame
+        }
+        imageProxy.use { frame.copyPixelsFromBuffer(it.planes[0].buffer) }
+
+        // Tamanho final depois da rotação.
+        val outW = if (rotation % 180 == 0) w else h
+        val outH = if (rotation % 180 == 0) h else w
+
+        frameBufferIndex = 1 - frameBufferIndex
+        var prepared = frameBuffers[frameBufferIndex]
+        if (prepared == null || prepared.width != outW || prepared.height != outH) {
+            prepared = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
+            frameBuffers[frameBufferIndex] = prepared
+        }
+
+        // Rotação + espelho (câmera frontal) em uma única operação, sem criar bitmap novo.
+        transform.reset()
+        transform.postTranslate(-w / 2f, -h / 2f)
+        transform.postRotate(rotation.toFloat())
+        if (lensFacing == CameraSelector.LENS_FACING_FRONT) {
+            transform.postScale(-1f, 1f)
+        }
+        transform.postTranslate(outW / 2f, outH / 2f)
+        Canvas(prepared).drawBitmap(frame, transform, null)
+
+        // Orientação deste quadro: do giroscópio, ou (sem giroscópio) calculada pela própria imagem.
+        var frameRotation = overlay.currentRotation()
+        if (useVisual && overlay.worldMode) {
+            val count = outW * outH
+            if (pixelBuffer.size != count) pixelBuffer = IntArray(count)
+            prepared.getPixels(pixelBuffer, 0, outW, 0, 0, outW, outH)
+            val r = visual.onFrame(pixelBuffer, outW, outH, overlay.handBoxes())
+            if (r != null) {
+                overlay.setGyro(r)
+                overlay.setWalk(visual.walkMeters())
+                frameRotation = r
+            }
+        }
+
+        // No VR Box, manda o frame para a tela desenhar nos dois olhos.
+        if (vrMode) overlay.setFrame(prepared, frameRotation)
+
+        landmarker.detectAsync(BitmapImageBuilder(prepared).build(), SystemClock.uptimeMillis())
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        uiHandler.removeCallbacks(clearVoiceRunnable)
+        recognizer?.let { try { it.destroy() } catch (e: Exception) { } }
+        recognizer = null
+        webTexture?.stop()
+        webView.stopLoading()
+        webView.destroy()
+        (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
+            .unregisterDisplayListener(displayListener)
+        cameraExecutor.shutdown()
+        handLandmarker?.close()
+    }
+
+    private companion object {
+        var micAskedAtStart = false
+        const val KEY_VR_MODE = "vr_mode"
+        const val KEY_LENS = "lens_facing"
+    }
+}

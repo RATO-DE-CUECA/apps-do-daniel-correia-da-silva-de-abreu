@@ -96,6 +96,19 @@ class WebTexture(private val activity: Activity) {
         }
     }
 
+    /** Abre um endereço no YouTube virtual (use na thread principal). Devolve false se ele ainda não está ligado. */
+    fun loadUrl(url: String): Boolean {
+        val w = presentation?.web ?: return false
+        loaded = true
+        w.loadUrl(url)
+        return true
+    }
+
+    /** Pausa o vídeo que estiver tocando (use na thread principal). */
+    fun pauseVideo() {
+        presentation?.web?.evaluateJavascript("document.querySelectorAll('video').forEach(function(v){v.pause();})", null)
+    }
+
     /** Toque no YouTube virtual. x e y em pixels da tela virtual (0..WIDTH, 0..HEIGHT). Use na thread principal. */
     fun touch(action: Int, x: Float, y: Float) {
         val decor = presentation?.window?.decorView ?: return
